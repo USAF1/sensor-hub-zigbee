@@ -29,12 +29,11 @@ typedef enum {
 } hub_mode_t;
 
 /**
- * @brief Per-sensor data — covers all three sensor families.
+ * @brief Per-sensor runtime + persisted data.
  *
- * ZG-204ZV          : presence (IAS alarm_1), temperature, humidity,
- *                     illuminance, battery
- * ZG-205Z/A         : presence (IAS alarm_1 + occupancy), illuminance
- * ZG-102Z / ZG-102ZA: contact (IAS alarm_1), tamper, battery_low, battery
+ * ZG-204ZV          : presence (IAS), temp, humidity, illuminance, battery
+ * ZG-205Z/A         : presence (IAS + occupancy), illuminance
+ * ZG-102Z / ZG-102ZA: contact (IAS), tamper, battery_low, battery
  */
 typedef struct {
     /* Identity */
@@ -42,21 +41,25 @@ typedef struct {
     uint16_t short_addr;
     uint8_t  endpoint;
     char     sensor_name[SENSOR_NAME_LEN];
-    uint8_t  sensor_type;   /* sensor_type_t stored as uint8 for NVS round-trip */
+    uint8_t  sensor_type;       /* sensor_type_t stored as uint8 for NVS */
+
+    /* Health */
+    bool     online;            /* true = actively communicating          */
+    uint8_t  ping_attempts;     /* watchdog retry counter                 */
 
     /* Presence / contact */
-    bool     presence;       /* ZG-204ZV, ZG-205Z/A — true = occupied  */
-    bool     contact_open;   /* ZG-102Z/A            — true = door open */
+    bool     presence;          /* ZG-204ZV, ZG-205Z/A: true = occupied   */
+    bool     contact_open;      /* ZG-102Z/A: true = door open            */
     bool     tamper;
     bool     battery_low;
 
     /* Environmental — ZG-204ZV only */
-    int16_t  temperature_cdeg;  /* °C × 100  e.g. 2150 = 21.50 °C      */
-    uint16_t humidity_cpct;     /* % × 100   e.g. 5000 = 50.00 %       */
-    uint16_t illuminance_raw;   /* ZCL lux (10^((raw-1)/10000) lux)     */
+    int16_t  temperature_cdeg;  /* deg C * 100,  e.g. 2150 = 21.50 C     */
+    uint16_t humidity_cpct;     /* % * 100,      e.g. 5000 = 50.00 %     */
+    uint16_t illuminance_raw;   /* ZCL lux value                          */
 
     /* Battery — ZG-204ZV and ZG-102Z/A */
-    uint8_t  battery_pct;       /* 0-100 %                              */
+    uint8_t  battery_pct;       /* 0-100 %                                */
 
     /* Timestamps */
     time_t   last_seen;
