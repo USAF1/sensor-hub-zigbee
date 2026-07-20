@@ -12,7 +12,7 @@
 // CONSTANTS
 // ============================================================================
 
-#define MAX_SENSORS           12
+#define MAX_SENSORS           15
 #define POLL_INTERVAL_MS      5000
 #define PAIRING_TIMEOUT_SEC   120
 #define IEEE_ADDR_STR_LEN     24
@@ -28,51 +28,68 @@
  */
 typedef enum {
     MODE_PAIRING = 0,
-    MODE_NORMAL = 1,
+    MODE_NORMAL  = 1,
 } hub_mode_t;
 
 /**
- * @brief Sensor data structure (runtime)
+ * @brief Per-sensor data — covers all three sensor families.
+ *
+ * ZG-204ZV  : presence (IAS alarm_1), temperature, humidity, illuminance, battery
+ * ZG-205Z/A : presence (IAS alarm_1 + occupancy), illuminance
+ * ZG-102Z/A : contact (IAS alarm_1), tamper, battery_low, battery
  */
 typedef struct {
-    char ieee_addr[IEEE_ADDR_STR_LEN];
+    /* Identity */
+    char     ieee_addr[IEEE_ADDR_STR_LEN];
     uint16_t short_addr;
-    char sensor_name[SENSOR_NAME_LEN];
-    uint8_t status;              // 0 = Vacant, 1 = Occupied
-    uint8_t endpoint;            // Zigbee endpoint
-    time_t last_polled;
-    time_t last_response;
-    uint32_t poll_count;
-    uint32_t failed_polls;
-    int8_t rssi;                 // Signal strength (dBm)
+    uint8_t  endpoint;
+    char     sensor_name[SENSOR_NAME_LEN];
+
+    /* Presence / contact — shared across types */
+    bool     presence;       /* ZG-204ZV, ZG-205Z/A : true = occupied            */
+    bool     contact_open;   /* ZG-102Z/A           : true = door open           */
+    bool     tamper;
+    bool     battery_low;
+
+    /* Environmental — ZG-204ZV only */
+    int16_t  temperature_cdeg;  /* °C × 100  e.g. 2150 = 21.50 °C              */
+    uint16_t humidity_cpct;     /* % × 100   e.g. 5000 = 50.00 %               */
+    uint16_t illuminance_raw;   /* ZCL lux value (10^((raw-1)/10000) lux)       */
+
+    /* Battery — ZG-204ZV and ZG-102Z/A */
+    uint8_t  battery_pct;       /* 0-100 %                                      */
+
+    /* Timestamps */
+    time_t   last_seen;
+    time_t   last_change;
 } sensor_t;
 
 /**
- * @brief Hub status aggregation
+ * @brief Hub aggregate status
  */
 typedef struct {
-    uint8_t overall_status;      // 0 = Vacant, 1 = Occupied
+    bool   occupied;        /* true if ANY mmWave sensor reports presence       */
     time_t timestamp;
     time_t last_change;
 } hub_status_t;
 
 /**
- * @brief Hub configuration
+ * @brief Hub configuration (persisted to NVS)
  */
 typedef struct {
     hub_status_t hub_status;
-    sensor_t sensors[MAX_SENSORS];
-    uint8_t sensor_count;
-    hub_mode_t mode;
-    bool pairing_active;
-    time_t pairing_started;
+    sensor_t     sensors[MAX_SENSORS];
+    uint8_t      sensor_count;
+    hub_mode_t   mode;
+    bool         pairing_active;
+    time_t       pairing_started;
 } hub_config_t;
 
 /**
  * @brief Thread-safe config wrapper
  */
 typedef struct {
-    hub_config_t data;
+    hub_config_t      data;
     SemaphoreHandle_t mutex;
 } hub_config_safe_t;
 
@@ -80,19 +97,10 @@ typedef struct {
 // FUNCTION DECLARATIONS
 // ============================================================================
 
-// Thread safety
-hub_config_t* lock_config(void);
-void unlock_config(void);
+hub_config_t *lock_config(void);
+void          unlock_config(void);
 
-// Sensor management
-esp_err_t sensor_add(hub_config_t *config, const char *ieee_addr, uint16_t short_addr, uint8_t endpoint);
-esp_err_t sensor_update_status(hub_config_t *config, const char *ieee_addr, uint8_t status, int8_t rssi);
-sensor_t* sensor_find_by_short_addr(hub_config_t *config, uint16_t short_addr);
-uint8_t sensor_aggregate_status(hub_config_t *config);
-void print_sensors(hub_config_t *config);
-
-// NVS persistence
 esp_err_t save_config(hub_config_t *config);
 esp_err_t load_config(hub_config_t *config);
 
-#endif // MAIN_H
+#endif /* MAIN_H */
