@@ -882,7 +882,9 @@ static void zcl_core_read_attr_rsp_handler(ezb_zcl_cmd_read_attr_rsp_message_t *
                 if (fa) {
                     fa->short_addr = short_addr;
                     fa->ep         = ep;
-                    xTaskCreate(deferred_fade_task, "fade_send", 2048, fa, 3, NULL);
+                    if (xTaskCreate(deferred_fade_task, "fade_send", 2048, fa, 3, NULL) != pdPASS) {
+                        free(fa); /* task creation failed — avoid leak */
+                    }
                 }
                 g_meta[idx].fade_sent = true;
             }
@@ -1423,11 +1425,9 @@ static void sensor_watchdog_task(void *arg)
 
             send_ping(short_addr, ep, i);
 
-            /* Wait for response window */
+            /* Wait for response and retry up to WATCHDOG_PING_RETRIES times */
             vTaskDelay(pdMS_TO_TICKS(WATCHDOG_PING_TIMEOUT_MS));
-
-            if (g_meta[i].ping_pending) {
-                /* No response — try once more */
+            while (g_meta[i].ping_pending && g_meta[i].rejoin_count < WATCHDOG_PING_RETRIES) {
                 g_meta[i].rejoin_count++;
                 send_ping(short_addr, ep, i);
                 vTaskDelay(pdMS_TO_TICKS(WATCHDOG_PING_TIMEOUT_MS));
