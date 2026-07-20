@@ -1,0 +1,51 @@
+# ESP-IDF Build output
+build/
+build_*_esp32*/
+
+# ESP-IDF managed components lock
+dependencies.lock
+
+# VS Code settings (optional - keep if team shares config)
+.vscode/
+
+# Eclipse project files
+.project
+.cproject
+.settings/
+
+# SDK config backup
+sdkconfig.old
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# macOS
+.DS_Store
+
+# Linux temp files
+*~
+
+# Windows temp files
+Thumbs.db
+desktop.ini
+
+# Partition table binary
+*.bin
+
+# NVS partition CSV sensitive data (if generated locally)
+nvs_data*.csv
+
+# Logs
+*.log
+
+# CMake generated
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+
+# Ninja build files
+*.ninja
+*.ninja_deps
+*.ninja_log
