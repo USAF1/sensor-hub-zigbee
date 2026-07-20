@@ -61,6 +61,10 @@ typedef struct {
     /* Timestamps */
     time_t   last_seen;
     time_t   last_change;
+
+    /* Watchdog / connectivity */
+    bool    online;          /* true = sensor actively communicating     */
+    uint8_t ping_attempts;   /* watchdog ping retry counter              */
 } sensor_t;
 
 typedef struct {
