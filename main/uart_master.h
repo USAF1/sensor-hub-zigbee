@@ -27,8 +27,8 @@
 // ============================================================================
 
 #define UART_MASTER_PORT     UART_NUM_1
-#define UART_MASTER_TX_PIN   4
-#define UART_MASTER_RX_PIN   5
+#define UART_MASTER_TX_PIN   8
+#define UART_MASTER_RX_PIN   9
 #define UART_MASTER_BAUD     115200
 
 // ============================================================================

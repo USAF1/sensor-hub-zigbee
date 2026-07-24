@@ -19,6 +19,7 @@
  *   IAS Zone CLIENT cluster — fixes door sensor enroll loop
  *   Illuminance discarded — reduces Zigbee traffic
  *   Battery clamped to 100%
+ *   Rejoin poll on boot — proactively invites known sensors back
  */
 
 #include <stdio.h>
@@ -91,7 +92,7 @@
  *   0 = disabled (lab debug — avoids false offline during testing)
  *   1 = enabled  (production)
  */
-#define FACTORY_RESET_MODE  0
+#define FACTORY_RESET_MODE  1
 #define RAW_LOGS_MODE       0
 #define WATCHDOG_ENABLE     1
 
@@ -100,6 +101,11 @@
 
 /* Watchdog retry count — number of ping retries before marking offline */
 #define WATCHDOG_PING_RETRIES  2
+
+/* Rejoin poll: delay after network forms before polling known sensors */
+#define REJOIN_POLL_DELAY_MS   2000
+/* Gap between individual sensor polls — avoids radio flooding */
+#define REJOIN_POLL_GAP_MS     500
 
 // ============================================================================
 // LOGGING MACROS
@@ -331,16 +337,6 @@ static void restore_meta_from_nvs(hub_config_t *config)
 
 // ============================================================================
 // UNIT OCCUPANCY ENGINE  (call with config lock HELD)
-//
-// Triggered ONLY by door OPEN→CLOSED event (sets door_closed_pending).
-// Re-evaluated when presence changes while door_closed_pending is true.
-//
-// Rules:
-//   VACANT  → OCCUPIED : any online ROLE_PRESENCE sensor = YES
-//   OCCUPIED → VACANT  : all online ROLE_PRESENCE sensors = NO
-//
-// Presence alone never changes unit state.
-// Sensor going offline never changes unit state (safe default).
 // ============================================================================
 
 static void evaluate_unit_occupancy_locked(hub_config_t *c)
@@ -351,7 +347,6 @@ static void evaluate_unit_occupancy_locked(hub_config_t *c)
     bool all_no        = true;
     int  online_count  = 0;
 
-    /* Fixed buffer snapshot for log — no allocation */
     char snap[64] = {0};
     int  spos = 0;
     spos += snprintf(snap + spos, sizeof(snap) - (size_t)spos, "[");
@@ -396,7 +391,6 @@ static void evaluate_unit_occupancy_locked(hub_config_t *c)
 
 // ============================================================================
 // HUB AGGREGATE PRESENCE  (call with config lock HELD)
-// Only counts online sensors — offline sensors excluded.
 // ============================================================================
 
 static void update_hub_presence_locked(hub_config_t *c)
@@ -568,7 +562,7 @@ esp_err_t load_config(hub_config_t *config)
     uint8_t unit_st = UNIT_VACANT;
     nvs_get_u8(handle, "unit_state", &unit_st);
     config->unit_state          = (unit_occupancy_t)unit_st;
-    config->door_closed_pending = false; /* never carry pending across reboot */
+    config->door_closed_pending = false;
 
     uint8_t sensor_count = 0;
     nvs_get_u8(handle, "sensor_count", &sensor_count);
@@ -681,7 +675,6 @@ static void deferred_fade_task(void *arg)
 
 // ============================================================================
 // REPORTING CONFIGURATION
-// Illuminance: NOT configured — discarded silently on receipt.
 // ============================================================================
 
 static void configure_reporting_for_model(uint16_t short_addr, uint8_t ep)
@@ -689,7 +682,6 @@ static void configure_reporting_for_model(uint16_t short_addr, uint8_t ep)
     int idx = find_sensor_index_by_short(short_addr);
     if (idx < 0 || g_meta[idx].reporting_configured) return;
 
-    /* Read type from persisted config — NOT from g_meta */
     hub_config_t *cfg_tmp = lock_config();
     if (!cfg_tmp) return;
     sensor_type_t type = (sensor_type_t)cfg_tmp->sensors[idx].sensor_type;
@@ -706,7 +698,6 @@ static void configure_reporting_for_model(uint16_t short_addr, uint8_t ep)
 
     if (type == SENSOR_ZG_204ZV) {
 
-        /* IAS ZoneStatus — 2s heartbeat + immediate on change */
         ezb_zcl_config_report_record_t ias = {
             .direction = EZB_ZCL_REPORTING_SEND,
             .attr_id   = ATTR_IAS_ZONE_STATUS,
@@ -720,7 +711,6 @@ static void configure_reporting_for_model(uint16_t short_addr, uint8_t ep)
         (void)ezb_zcl_config_report_cmd_req(&cmd);
         DEV_LOG(TAG, "Configured IAS reporting for 0x%04hx", short_addr);
 
-        /* Temperature — on change (0.5°C threshold) */
         ezb_zcl_config_report_record_t temp = {
             .direction = EZB_ZCL_REPORTING_SEND,
             .attr_id   = ATTR_TEMPERATURE_MEASURED,
@@ -734,7 +724,6 @@ static void configure_reporting_for_model(uint16_t short_addr, uint8_t ep)
         (void)ezb_zcl_config_report_cmd_req(&cmd);
         DEV_LOG(TAG, "Configured temp reporting for 0x%04hx", short_addr);
 
-        /* Humidity — on change (1% threshold) */
         ezb_zcl_config_report_record_t hum = {
             .direction = EZB_ZCL_REPORTING_SEND,
             .attr_id   = ATTR_HUMIDITY_MEASURED,
@@ -748,7 +737,6 @@ static void configure_reporting_for_model(uint16_t short_addr, uint8_t ep)
         (void)ezb_zcl_config_report_cmd_req(&cmd);
         DEV_LOG(TAG, "Configured humidity reporting for 0x%04hx", short_addr);
 
-        /* Battery — periodic + on change */
         ezb_zcl_config_report_record_t batt = {
             .direction = EZB_ZCL_REPORTING_SEND,
             .attr_id   = ATTR_BATTERY_PERCENT,
@@ -764,7 +752,6 @@ static void configure_reporting_for_model(uint16_t short_addr, uint8_t ep)
 
     } else if (type == SENSOR_ZG_205Z_A) {
 
-        /* Occupancy — every 2 seconds (presence heartbeat) */
         ezb_zcl_config_report_record_t occ = {
             .direction = EZB_ZCL_REPORTING_SEND,
             .attr_id   = ATTR_OCCUPANCY,
@@ -781,7 +768,6 @@ static void configure_reporting_for_model(uint16_t short_addr, uint8_t ep)
 
     } else if (type == SENSOR_ZG_102Z || type == SENSOR_ZG_102ZA) {
 
-        /* Battery — door state is event-driven via IAS */
         ezb_zcl_config_report_record_t batt = {
             .direction = EZB_ZCL_REPORTING_SEND,
             .attr_id   = ATTR_BATTERY_PERCENT,
@@ -801,7 +787,6 @@ static void configure_reporting_for_model(uint16_t short_addr, uint8_t ep)
 
 // ============================================================================
 // CLUSTER BINDING
-// Illuminance removed from all bind lists — not needed.
 // ============================================================================
 
 static void bind_model_clusters(uint16_t short_addr,
@@ -925,6 +910,102 @@ static void request_model_id(uint16_t short_addr, uint8_t ep)
 }
 
 // ============================================================================
+// REJOIN POLL TASK
+//
+// Called once after network formation. Proactively sends a ZDO NWK_addr_req
+// to each known sensor's IEEE address. This wakes sensors that are in range
+// but waiting to be invited — particularly useful when:
+//   - Sensors lost their network key (battery removed during testing)
+//   - Sensors are slow to rejoin after coordinator reboot
+//   - Development/lab environment where sensors are powered on after hub
+//
+// Sensors that still have their network key respond and send DEVICE_ANNCE.
+// Sensors that lost their key see the open pairing window and re-associate.
+// ============================================================================
+
+static void rejoin_task(void *arg)
+{
+    (void)arg;
+
+    /* Wait for Zigbee stack and pairing window to fully open */
+    vTaskDelay(pdMS_TO_TICKS(REJOIN_POLL_DELAY_MS));
+
+    hub_config_t *c = lock_config();
+    if (!c || c->sensor_count == 0) {
+        if (c) unlock_config();
+        PROD_LOG(TAG, "[JOIN] No sensors in NVS — skipping rejoin poll");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    int count = c->sensor_count;
+    PROD_LOG(TAG, "[JOIN] Polling %d known sensor(s) to rejoin...", count);
+
+    /* Snapshot all IEEE addresses while locked, then release */
+    char ieee_list[MAX_SENSORS][IEEE_ADDR_STR_LEN];
+    for (int i = 0; i < count; i++) {
+        strncpy(ieee_list[i], c->sensors[i].ieee_addr, IEEE_ADDR_STR_LEN - 1);
+        ieee_list[i][IEEE_ADDR_STR_LEN - 1] = '\0';
+    }
+    unlock_config();
+
+    for (int i = 0; i < count; i++) {
+        /* Skip empty/invalid entries */
+        if (ieee_list[i][0] == '\0') continue;
+
+        /* Convert IEEE string "AA:BB:CC:DD:EE:FF:GG:HH" to byte array */
+        ezb_extaddr_t target_ieee = {0};
+        unsigned int  bytes[8]   = {0};
+        int parsed = sscanf(ieee_list[i],
+                            "%02X:%02X:%02X:%02X:%02X:%02X:%02X:%02X",
+                            &bytes[7], &bytes[6], &bytes[5], &bytes[4],
+                            &bytes[3], &bytes[2], &bytes[1], &bytes[0]);
+
+        if (parsed != 8) {
+            ESP_LOGW(TAG, "[JOIN] Sensor %d: invalid IEEE '%s' — skip",
+                     i + 1, ieee_list[i]);
+            continue;
+        }
+
+        for (int b = 0; b < 8; b++)
+            target_ieee.u8[b] = (uint8_t)bytes[b];
+
+        /*
+         * ZDO NWK_addr_req — broadcast asking for the short address of this
+         * specific IEEE address. The correct field name per SDK header is
+         * 'ieee_addr_of_interest' (zdo_dev_srv_disc.h line 59).
+         * The sensor will respond if awake and in range.
+         * Response triggers DEVICE_ANNCE which is handled by
+         * register_or_update_joined_sensor() and the full join sequence.
+         */
+        ezb_zdo_nwk_addr_req_t req = {0};
+        req.dst_nwk_addr                    = 0xFFFF;  /* IEEE broadcast */
+        req.field.ieee_addr_of_interest     = target_ieee;  /* correct field name */
+        req.field.request_type              = 0;        /* single device response */
+        req.field.start_index               = 0;
+        req.cb                              = NULL;     /* fire and forget */
+        req.user_ctx                        = NULL;
+
+        esp_zigbee_lock_acquire(portMAX_DELAY);
+        ezb_err_t ret = ezb_zdo_nwk_addr_req(&req);
+        esp_zigbee_lock_release();
+
+        if (ret == EZB_ERR_NONE) {
+            PROD_LOG(TAG, "[JOIN] Rejoin poll sent to sensor %d (%s)",
+                     i + 1, ieee_list[i]);
+        } else {
+            ESP_LOGW(TAG, "[JOIN] Rejoin poll failed for sensor %d: 0x%04x",
+                     i + 1, ret);
+        }
+
+        /* Gap between polls — avoids flooding the 802.15.4 radio */
+        vTaskDelay(pdMS_TO_TICKS(REJOIN_POLL_GAP_MS));
+    }
+
+    PROD_LOG(TAG, "[JOIN] Rejoin poll complete — waiting for DEVICE_ANNCE");
+    vTaskDelete(NULL);
+}
+// ============================================================================
 // ZCL CALLBACKS
 // ============================================================================
 
@@ -938,7 +1019,6 @@ static void zcl_core_read_attr_rsp_handler(
     int idx = find_sensor_index_by_short(short_addr);
     if (idx < 0) return;
 
-    /* Any response = sensor is alive — mark online inside lock */
     {
         hub_config_t *c = lock_config();
         if (c) {
@@ -1009,12 +1089,6 @@ static void zcl_core_read_attr_rsp_handler(
     }
 }
 
-/*
- * IAS Zone Enroll Request.
- * Must respond IMMEDIATELY — before any other processing.
- * Delayed response causes sensor to leave and re-join in a loop.
- * IAS Zone CLIENT cluster must be registered on coordinator endpoint.
- */
 static void zcl_ias_zone_enroll_handler(
         ezb_zcl_ias_zone_enroll_req_message_t *message)
 {
@@ -1045,7 +1119,6 @@ static void zcl_ias_zone_enroll_handler(
                  short_addr, ret);
     }
 
-    /* Mark online inside lock — no separate lock/unlock race */
     if (idx >= 0) {
         hub_config_t *c = lock_config();
         if (c) {
@@ -1064,20 +1137,6 @@ static void zcl_ias_zone_enroll_handler(
     }
 }
 
-/*
- * IAS Zone Status Change Notification.
- *
- * DOOR sensors (ROLE_DOOR):
- *   OPEN→CLOSED sets door_closed_pending and evaluates occupancy.
- *   All state changes sent to Master via UART.
- *   Door alarm tracker notified on every state change.
- *
- * PRESENCE sensors (ZG-204ZV via IAS):
- *   Only logs and notifies Master on state CHANGE — not on 2s heartbeat.
- *   If door_closed_pending, re-evaluates unit occupancy.
- *
- * All sensors: marked ONLINE inside the lock on every message.
- */
 static void zcl_ias_zone_status_change_handler(
         ezb_zcl_ias_zone_status_change_notif_message_t *message)
 {
@@ -1103,7 +1162,6 @@ static void zcl_ias_zone_status_change_handler(
     hub_config_t *c = lock_config();
     if (!c) return;
 
-    /* Mark online inside lock — eliminates double-lock race */
     bool was_offline = !c->sensors[idx].online;
     c->sensors[idx].online    = true;
     c->sensors[idx].last_seen = time(NULL);
@@ -1129,14 +1187,8 @@ static void zcl_ias_zone_status_change_handler(
             PROD_LOG(TAG, "[DATA] %s [%s] contact=%s",
                      s->sensor_name, friendly_name_from_type(t),
                      alarm1 ? "OPEN" : "CLOSED");
-
-            /* Send door event to Master */
             uart_master_send_door(s->sensor_name, alarm1);
-
-            /* Notify door alarm tracker */
             uart_master_notify_door_state(idx, s->sensor_name, alarm1);
-
-            /* OPEN→CLOSED: trigger occupancy evaluation */
             if (was_open && !alarm1) {
                 c->door_closed_pending = true;
                 evaluate_unit_occupancy_locked(c);
@@ -1174,12 +1226,6 @@ static void zcl_ias_zone_status_change_handler(
     mark_dirty();
 }
 
-/*
- * ZCL Attribute Report handler.
- * Illuminance: discarded immediately — too many updates, not needed.
- * Battery: reported to Master on every update.
- * All handlers: mark sensor online inside lock.
- */
 static void zcl_core_cmd_report_attr_handler(
         ezb_zcl_cmd_report_attr_message_t *message)
 {
@@ -1191,7 +1237,6 @@ static void zcl_core_cmd_report_attr_handler(
     RAW_LOG("[RAW] ReportAttr src=0x%04hx cluster=0x%04hx\n",
             short_addr, cluster_id);
 
-    /* Discard illuminance — sensor sends regardless of no binding */
     if (cluster_id == CLUSTER_ILLUMINANCE) return;
 
     int idx = find_sensor_index_by_short(short_addr);
@@ -1200,7 +1245,6 @@ static void zcl_core_cmd_report_attr_handler(
     hub_config_t *c = lock_config();
     if (!c) return;
 
-    /* Mark online inside lock */
     bool was_offline = !c->sensors[idx].online;
     c->sensors[idx].online    = true;
     c->sensors[idx].last_seen = time(NULL);
@@ -1215,9 +1259,7 @@ static void zcl_core_cmd_report_attr_handler(
     sensor_type_t t       = (sensor_type_t)s->sensor_type;
     bool          changed = false;
 
-    /* ---- ZG-204ZV ---- */
     if (t == SENSOR_ZG_204ZV) {
-
         if (cluster_id == CLUSTER_TEMP_MEASUREMENT) {
             for (ezb_zcl_report_attr_variable_t *v = message->in.variables;
                  v; v = v->next) {
@@ -1263,19 +1305,15 @@ static void zcl_core_cmd_report_attr_handler(
                 }
             }
         }
-    }
-
-    /* ---- ZG-205Z/A ---- */
-    else if (t == SENSOR_ZG_205Z_A) {
+    } else if (t == SENSOR_ZG_205Z_A) {
         if (cluster_id == CLUSTER_OCCUPANCY_SENSING) {
             for (ezb_zcl_report_attr_variable_t *v = message->in.variables;
                  v; v = v->next) {
                 if (v->attr_id == ATTR_OCCUPANCY) {
-                    bool occ          = (*(uint8_t *)v->attr_value) != 0;
-                    bool state_chgd   = (s->presence != occ);
+                    bool occ        = (*(uint8_t *)v->attr_value) != 0;
+                    bool state_chgd = (s->presence != occ);
                     s->presence = occ;
                     changed     = true;
-
                     if (state_chgd) {
                         s->last_change = time(NULL);
                         PROD_LOG(TAG, "[DATA] %s [ZG-205Z/A] presence=%s",
@@ -1291,10 +1329,7 @@ static void zcl_core_cmd_report_attr_handler(
                 }
             }
         }
-    }
-
-    /* ---- ZG-102Z / ZG-102ZA ---- */
-    else if (t == SENSOR_ZG_102Z || t == SENSOR_ZG_102ZA) {
+    } else if (t == SENSOR_ZG_102Z || t == SENSOR_ZG_102ZA) {
         if (cluster_id == CLUSTER_POWER_CONFIG) {
             for (ezb_zcl_report_attr_variable_t *v = message->in.variables;
                  v; v = v->next) {
@@ -1394,8 +1429,6 @@ static bool raw_frame_handler(const ezb_zcl_raw_frame_t *raw_frame)
 
 // ============================================================================
 // WATCHDOG TASK
-// Pings each sensor and marks offline after no response.
-// Reads all intervals from uart_hub_config — fully runtime-configurable.
 // ============================================================================
 
 #if WATCHDOG_ENABLE
@@ -1403,8 +1436,6 @@ static void sensor_watchdog_task(void *arg)
 {
     (void)arg;
 
-    /* Wait one full cycle before first check — avoids false offline
-     * during the boot + re-join period */
     uart_hub_config_t cfg;
     uart_master_get_config(&cfg);
     vTaskDelay(pdMS_TO_TICKS(
@@ -1505,10 +1536,7 @@ static void pairing_window_task(void *arg)
     ezb_bdb_open_network(0);
     PROD_LOG(TAG, "Pairing window closed");
     print_sensor_summary();
-
-    /* Notify Master — all sensors that rejoined are now known */
     uart_master_send_hub_ready();
-
     vTaskDelete(NULL);
 }
 
@@ -1554,6 +1582,15 @@ static bool esp_zigbee_app_signal_handler(const ezb_app_signal_t *app_signal)
                           ? 255 : cfg.pairing_duration_sec));
             xTaskCreate(pairing_window_task, "pair_win",
                         3072, NULL, 4, NULL);
+
+            /*
+             * Proactively poll all known sensors to rejoin.
+             * Handles sensors that are awake but waiting to be invited,
+             * or that lost their network key (battery removed in lab).
+             */
+            xTaskCreate(rejoin_task, "rejoin",
+                        3072, NULL, 3, NULL);
+
         } else {
             ESP_LOGW(TAG,
                      "Network formation failed (status=%d) — will retry",
@@ -1732,15 +1769,6 @@ void app_main(void)
         nvs_flash_init_partition(ESP_ZIGBEE_STORAGE_PARTITION_NAME));
 
 #if FACTORY_RESET_MODE
-    /*
-     * FACTORY_RESET_MODE = 1
-     * Erases the "nvs" partition only — sensor registry + uart config.
-     * The "zb_storage" partition (Zigbee network keys) is preserved.
-     * Sensors that are already paired WILL re-join automatically without
-     * pressing any button because they still hold valid network credentials.
-     * Use this mode when deploying a fresh unit so old test sensor names
-     * are wiped. Set FACTORY_RESET_MODE=0 for normal operation.
-     */
     ESP_LOGW(TAG, "FACTORY RESET MODE — erasing sensor NVS");
     nvs_flash_erase();
     nvs_flash_init();
@@ -1755,11 +1783,6 @@ void app_main(void)
     memset(&g_config.data, 0, sizeof(g_config.data));
     load_config(&g_config.data);
 
-    /*
-     * UART Master init — after NVS init and load_config so the uart_hub
-     * NVS config is available. Before Zigbee stack so UART is ready to
-     * receive set_config from Master before sensors start joining.
-     */
     esp_err_t uart_err = uart_master_init();
     if (uart_err != ESP_OK) {
         ESP_LOGW(TAG,
@@ -1767,11 +1790,6 @@ void app_main(void)
                  esp_err_to_name(uart_err));
     }
 
-    /*
-     * Notify Master that Sensor Hub has booted.
-     * Sent before Zigbee stack starts — Master knows hub is alive
-     * even before any sensor joins.
-     */
     uart_master_send_hub_boot();
 
     xTaskCreate(esp_zigbee_stack_main_task, "Zigbee_main",
