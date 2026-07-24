@@ -92,7 +92,7 @@
  *   1 = enabled  (production)
  */
 #define FACTORY_RESET_MODE  1
-#define RAW_LOGS_MODE       1
+#define RAW_LOGS_MODE       0
 #define WATCHDOG_ENABLE     1
 
 #define ZIGBEE_PRIMARY_CHANNEL_MASK   0x07FFF800UL
