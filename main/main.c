@@ -1760,6 +1760,19 @@ static void esp_zigbee_stack_main_task(void *pvParameters)
 // APP ENTRY POINT
 // ============================================================================
 
+/*
+ * Change 1: FACTORY_RESET_MODE set to 0
+ *   Sensors now persist across reboots.
+ *   Set to 1 only when deploying a fresh unit.
+ *
+ * Change 2: uart_master_send_hub_boot() removed from app_main.
+ *   The hub_boot_retry_task launched inside uart_master_init() owns it.
+ */
+
+/* At top of main.c — change this line: */
+#define FACTORY_RESET_MODE  0    /* was 1 — now sensors persist across reboot */
+
+/* app_main — remove uart_master_send_hub_boot() call: */
 void app_main(void)
 {
     print_banner();
@@ -1790,7 +1803,11 @@ void app_main(void)
                  esp_err_to_name(uart_err));
     }
 
-    uart_master_send_hub_boot();
+    /*
+     * DO NOT call uart_master_send_hub_boot() here.
+     * hub_boot_retry_task inside uart_master_init() handles it —
+     * retries every 2s for up to 120s until Master responds.
+     */
 
     xTaskCreate(esp_zigbee_stack_main_task, "Zigbee_main",
                 4096 * 2, NULL, 5, NULL);
