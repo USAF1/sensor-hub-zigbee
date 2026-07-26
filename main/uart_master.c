@@ -67,7 +67,7 @@ static StaticTask_t s_tmr_tcb;
  * context + safety margin.
  * DO NOT reduce below 3584.
  */
-static StackType_t  s_boot_retry_stack[3584];
+static StackType_t  s_boot_retry_stack[4096];
 static StaticTask_t s_boot_retry_tcb;
 
 static char     s_rx_line[UART_MASTER_LINE_BUF_SIZE];
@@ -1054,7 +1054,7 @@ esp_err_t uart_master_init(void)
      * DO NOT reduce stack below 3584 or retry count below 60.
      */
     xTaskCreateStatic(hub_boot_retry_task, "hub_boot_retry",
-                      3584, NULL,
+                      4096, NULL,
                       UART_MASTER_TX_TASK_PRIO + 1,
                       s_boot_retry_stack, &s_boot_retry_tcb);
 

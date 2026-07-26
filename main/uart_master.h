@@ -31,7 +31,7 @@
 #define UART_MASTER_RX_BUF_SIZE    1024
 #define UART_MASTER_TX_BUF_SIZE    0
 #define UART_MASTER_LINE_BUF_SIZE  512
-#define UART_MASTER_TX_MSG_SIZE    256
+#define UART_MASTER_TX_MSG_SIZE    512
 #define UART_MASTER_TX_QUEUE_DEPTH 16
 
 // ============================================================================
