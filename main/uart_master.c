@@ -3,16 +3,9 @@
  * Sensor Hub <-> Master UART Communication Layer
  * Innovatsii EMS — Pico 1
  *
- * Stack overflow fix (2026-07-26):
- *   uart_tx_task previously declared `tx_msg_t msg` as a local variable.
- *   With TX_MSG_SIZE=512 this puts 514 bytes on the 2048-byte task stack.
- *   Combined with uart_write_bytes() internals (~300 bytes) + FreeRTOS
- *   context (~200 bytes) this overflows the stack at ~29 minutes runtime.
- *   Fix: s_tx_dequeue_buf is now a static global — never on any stack.
- *
- * hub_boot retry:
- *   Sends hub_boot every 2 seconds for up to 120 seconds (60 retries).
- *   Stops immediately when Master responds with set_config.
+ * Stack overflow fix: s_tx_dequeue_buf is static global — never on stack.
+ * Raw hex debug logging removed — reduces serial noise in production.
+ * hub_boot retry: 60 attempts over 120 seconds.
  */
 
 #include "uart_master.h"
@@ -65,28 +58,14 @@ static StaticTask_t s_rx_tcb;
 static StackType_t  s_tmr_stack[UART_MASTER_TMR_TASK_STACK];
 static StaticTask_t s_tmr_tcb;
 
-/*
- * hub_boot retry task stack — 4096 bytes.
- * Sized for: tx_send_fmt 512-byte local buf + vsnprintf internals (~200)
- * + debug_print_tx static hex_buf (NOT on stack) + FreeRTOS context (~200)
- * + safety margin.
- * DO NOT reduce below 4096.
- */
 static StackType_t  s_boot_retry_stack[4096];
 static StaticTask_t s_boot_retry_tcb;
 
 /*
  * Static TX dequeue buffer — NOT on the uart_tx_task stack.
- *
  * CRITICAL: Must NOT be a local variable inside uart_tx_task.
- * With TX_MSG_SIZE=512, a local tx_msg_t is 514 bytes. Combined with
- * uart_write_bytes() internal stack usage (~300 bytes) and the FreeRTOS
- * task context save frame (~200 bytes), the total exceeds
- * UART_MASTER_TX_TASK_STACK (2048 bytes), causing a stack protection
- * fault at ~29 minutes (first large message sent).
- *
- * uart_tx_task is the ONLY consumer of the TX queue so this static buffer
- * is safe — only one dequeue ever happens at a time.
+ * With TX_MSG_SIZE=512, a local tx_msg_t is 514 bytes — overflows the
+ * 2048-byte task stack causing a crash at ~29 minutes runtime.
  */
 static tx_msg_t s_tx_dequeue_buf;
 
@@ -97,11 +76,6 @@ static SemaphoreHandle_t s_cfg_mutex = NULL;
 static StaticSemaphore_t s_cfg_mutex_cb;
 static uart_hub_config_t s_config;
 
-/*
- * Set to true when Master sends set_config.
- * hub_boot_retry_task stops retrying immediately.
- * Volatile — written from RX task, read from retry task.
- */
 static volatile bool s_master_config_received = false;
 
 typedef struct {
@@ -124,30 +98,6 @@ static void uptime_str(char *buf, size_t len)
              (unsigned)(sec / 3600),
              (unsigned)((sec % 3600) / 60),
              (unsigned)(sec % 60));
-}
-
-// ============================================================================
-// RAW TX DEBUG PRINT
-// hex_buf is static — NOT on the stack.
-// ============================================================================
-
-static void debug_print_tx(const char *data, uint16_t len)
-{
-    uint16_t print_len = len;
-    if (print_len > 0 && data[print_len - 1] == '\n') print_len--;
-    ESP_LOGI(TAG, "[TX RAW] %.*s", (int)print_len, data);
-
-    static char hex_buf[256];
-    int      hpos = 0;
-    uint16_t show = (len > 64) ? 64 : len;
-    for (uint16_t i = 0; i < show && hpos < (int)sizeof(hex_buf) - 4; i++) {
-        int n = snprintf(hex_buf + hpos, sizeof(hex_buf) - (size_t)hpos,
-                         "%02x ", (uint8_t)data[i]);
-        if (n > 0) hpos += n;
-    }
-    if (len > 64)
-        snprintf(hex_buf + hpos, sizeof(hex_buf) - (size_t)hpos, "...");
-    ESP_LOGI(TAG, "[TX HEX] %s", hex_buf);
 }
 
 // ============================================================================
@@ -265,7 +215,6 @@ static void tx_enqueue(const char *data, uint16_t len)
             ESP_LOGW(TAG, "tx_enqueue: msg too long (%u)", len);
         return;
     }
-    debug_print_tx(data, len);
     tx_msg_t msg;
     memcpy(msg.data, data, len);
     msg.data[len] = '\0';
@@ -292,9 +241,8 @@ static void tx_send_fmt(const char *fmt, ...)
 
 // ============================================================================
 // TX TASK
-//
-// CRITICAL: s_tx_dequeue_buf is STATIC — never on this task's stack.
-// DO NOT change back to a local variable — see declaration above.
+// s_tx_dequeue_buf is STATIC — never on this task's stack.
+// DO NOT change back to a local variable.
 // ============================================================================
 
 static void uart_tx_task(void *arg)
@@ -532,42 +480,17 @@ static void cmd_restart(const char *json, uint16_t len)
 
 // ============================================================================
 // RX TASK
+// Raw hex logging removed — only JSON commands are logged.
 // ============================================================================
 
 static void uart_rx_task(void *arg)
 {
     (void)arg;
     uint8_t chunk[128];
-    char    hex_line[80];
-    int     hex_pos   = 0;
-    uint8_t hex_count = 0;
-    hex_line[0] = '\0';
 
     for (;;) {
         int bytes = uart_read_bytes(UART_MASTER_PORT, chunk,
                                     sizeof(chunk), pdMS_TO_TICKS(20));
-
-        if (bytes > 0) {
-            for (int i = 0; i < bytes; i++) {
-                int n = snprintf(hex_line + hex_pos,
-                                 sizeof(hex_line) - (size_t)hex_pos,
-                                 "0x%02x ", chunk[i]);
-                if (n > 0) hex_pos += n;
-                hex_count++;
-                if (hex_count >= 16 || hex_pos >= 60) {
-                    ESP_LOGI(TAG, "[RX RAW] %s", hex_line);
-                    hex_pos   = 0;
-                    hex_count = 0;
-                    hex_line[0] = '\0';
-                }
-            }
-            if (hex_count > 0) {
-                ESP_LOGI(TAG, "[RX RAW] %s", hex_line);
-                hex_pos   = 0;
-                hex_count = 0;
-                hex_line[0] = '\0';
-            }
-        }
 
         for (int i = 0; i < bytes; i++) {
             uint8_t b = chunk[i];
@@ -576,7 +499,7 @@ static void uart_rx_task(void *arg)
                 if (s_rx_pos > 0) {
                     s_rx_line[s_rx_pos] = '\0';
                     if (s_rx_line[0] == '{') {
-                        ESP_LOGI(TAG, "[RX JSON] %s", s_rx_line);
+                        ESP_LOGI(TAG, "RX: %s", s_rx_line);
                         dispatch_command(s_rx_line, s_rx_pos);
                     } else {
                         ESP_LOGW(TAG,
@@ -1052,10 +975,6 @@ esp_err_t uart_master_init(void)
                       UART_MASTER_TMR_TASK_PRIO,
                       s_tmr_stack, &s_tmr_tcb);
 
-    /*
-     * hub_boot retry task — 4096 byte stack, 60 retries (120s window).
-     * DO NOT reduce stack below 4096 or retry count below 60.
-     */
     xTaskCreateStatic(hub_boot_retry_task, "hub_boot_retry",
                       4096, NULL,
                       UART_MASTER_TX_TASK_PRIO + 1,

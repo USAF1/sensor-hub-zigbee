@@ -8,6 +8,13 @@
  *   ZG-102Z             — HOBEIAN door:   IAS contact + Tamper + Batt
  *   ZG-102ZA            — HOBEIAN door:   IAS contact + Tamper + Batt
  *
+ * Boot state policy:
+ *   Unit state always resets to VACANT on boot.
+ *   Sensor registry (IEEE, names, types) persists across reboots.
+ *   The Master persists its own 4-state decision — Hub reset to VACANT
+ *   is safe and avoids stale state being reported to Master before
+ *   sensors have re-announced.
+ *
  * Rejoin / re-pair logic (two scenarios):
  *
  *   Scenario 1 — Hub reboot (all sensors have valid network keys):
@@ -16,10 +23,14 @@
  *     Non-sleepy sensors (ZG-204ZV, ZG-205Z/A): NWK_addr_req broadcast.
  *
  *   Scenario 2 — Sensor goes offline (battery replaced, lost network key):
- *     Sensor with valid key rejoins automatically.
+ *     Sensor with valid key rejoins automatically on power-up.
  *     Watchdog tracks miss_count per sensor.
+ *     DOOR sensors: time-based staleness check — no ZCL ping (sleepy device
+ *       cannot respond to unsolicited reads). Marked offline if no data
+ *       received in watchdog_interval_min × DOOR_STALE_CYCLES minutes.
+ *     PRESENCE sensors: ZCL ReadAttr ping — always-on radio responds.
  *     After WATCHDOG_OFFLINE_PAIRING_THRESHOLD consecutive missed cycles,
- *     watchdog opens WATCHDOG_PAIRING_REOPEN_SEC pairing window.
+ *     watchdog opens pairing window for key-loss recovery.
  */
 
 #include <stdio.h>
@@ -83,6 +94,16 @@
 #define REJOIN_POLL_DELAY_MS   2000
 #define REJOIN_POLL_GAP_MS     500
 
+/*
+ * DOOR_STALE_CYCLES:
+ *   Number of watchdog cycles before a DOOR sensor with no recent data
+ *   is marked offline. At watchdog_interval_min=2 and DOOR_STALE_CYCLES=3
+ *   this means 6 minutes of silence before marking offline.
+ *   ZG-102Z reports battery ~hourly and IAS on every door open/close.
+ *   6 minutes of silence is a reasonable offline threshold.
+ */
+#define DOOR_STALE_CYCLES  3
+
 // ============================================================================
 // LOGGING MACROS
 // ============================================================================
@@ -113,11 +134,6 @@ static void uptime_str(char *buf, size_t len)
 // FORWARD DECLARATIONS — functions defined in uart_hooks.c
 // ============================================================================
 
-/*
- * These are implemented in uart_hooks.c which is compiled as a separate
- * translation unit.  Without these declarations the compiler sees
- * uart_cmd_start_pairing() as an implicit declaration (error in C99+).
- */
 extern void uart_cmd_start_pairing(uint16_t duration_sec);
 extern void uart_cmd_stop_pairing(void);
 extern void uart_cmd_remove_sensor(int idx);
@@ -281,6 +297,7 @@ static void restore_meta_from_nvs(hub_config_t *config)
 {
     for (int i = 0; i < config->sensor_count; i++) {
         sensor_type_t t = (sensor_type_t)config->sensors[i].sensor_type;
+        /* All sensors start OFFLINE on boot — must re-announce to become active */
         config->sensors[i].online = false;
         if (t != SENSOR_UNKNOWN) {
             g_meta[i].model_known = true;
@@ -471,7 +488,11 @@ esp_err_t save_config(hub_config_t *config)
     nvs_set_u8(handle, "pairing_active",  config->pairing_active      ? 1 : 0);
     nvs_set_u8(handle, "pairing_expired", pairing_window_expired       ? 1 : 0);
     nvs_set_u8(handle, "hub_occupied",    config->hub_status.occupied ? 1 : 0);
-    nvs_set_u8(handle, "unit_state",      (uint8_t)config->unit_state);
+    /*
+     * NOTE: unit_state is intentionally NOT saved.
+     * We always boot to VACANT — see load_config() below.
+     * The Master persists its own 4-state decision independently.
+     */
 
     for (int i = 0; i < config->sensor_count; i++) {
         char key[16];
@@ -499,6 +520,7 @@ esp_err_t load_config(hub_config_t *config)
         config->pairing_active     = true;
         config->pairing_started    = time(NULL);
         config->unit_state         = UNIT_VACANT;
+        config->hub_status.occupied = false;
         config->door_closed_pending = false;
         PROD_LOG(TAG, "NVS empty — fresh install, unit=VACANT, pairing=OPEN");
         return ESP_OK;
@@ -521,10 +543,14 @@ esp_err_t load_config(hub_config_t *config)
     nvs_get_u8(handle, "hub_occupied", &hub_occ);
     config->hub_status.occupied = (hub_occ != 0);
 
-    uint8_t unit_st = UNIT_VACANT;
-    nvs_get_u8(handle, "unit_state", &unit_st);
-    config->unit_state           = (unit_occupancy_t)unit_st;
-    config->door_closed_pending  = false;
+    /*
+     * BOOT STATE POLICY: Always start VACANT.
+     * We do NOT restore unit_state from NVS. Sensors are all offline at boot
+     * and we cannot confirm occupancy until they re-announce. Starting VACANT
+     * is safe — the Master will re-evaluate from sensor events within ~60s.
+     */
+    config->unit_state          = UNIT_VACANT;
+    config->door_closed_pending = false;
 
     uint8_t sensor_count = 0;
     nvs_get_u8(handle, "sensor_count", &sensor_count);
@@ -542,11 +568,8 @@ esp_err_t load_config(hub_config_t *config)
     nvs_close(handle);
     restore_meta_from_nvs(config);
 
-    RAW_LOG("[RAW] load_config: sensor_count=%u pairing_expired=%d "
-            "hub_occupied=%d unit_state=%s\n",
-            (unsigned)config->sensor_count, pairing_window_expired,
-            (int)config->hub_status.occupied,
-            unit_state_str(config->unit_state));
+    PROD_LOG(TAG, "Loaded %d sensor(s) from NVS — unit=VACANT (boot policy)",
+             config->sensor_count);
     return ESP_OK;
 }
 
@@ -620,7 +643,6 @@ static void send_fade_time_zero(uint16_t short_addr, uint8_t ep)
     cmd.data_length                    = sizeof(payload);
     cmd.data                           = (uint8_t *)payload;
 
-    /* FIX: was  ezb_err_t ret = ...  which caused unused-variable warning */
     (void)ezb_zcl_custom_cluster_cmd_req(&cmd);
     DEV_LOG(TAG, "fading_time=0 → 0x%04hx ep%u", short_addr, ep);
 }
@@ -1028,7 +1050,6 @@ static void zcl_core_read_attr_rsp_handler(
             if (var->attr_id == ATTR_BASIC_ZCL_VERSION) {
                 DEV_LOG(TAG, "Ping response from 0x%04hx", short_addr);
             } else if (var->attr_id == ATTR_BASIC_MANUFACTURER_NAME) {
-                /* FIX: len only used in DEV_LOG which is a no-op in production */
                 uint8_t len = *(uint8_t *)var->attr_value;
                 (void)len;
                 DEV_LOG(TAG, "Sensor %d manufacturer: %.*s",
@@ -1400,16 +1421,11 @@ static bool raw_frame_handler(const ezb_zcl_raw_frame_t *raw_frame)
 {
     if (!raw_frame || !raw_frame->header) return false;
 
-    /* FIX: src_addr only used in RAW_LOG which is a no-op in production */
-    uint16_t src_addr   = raw_frame->header->src_addr.u.short_addr;
     uint16_t cluster_id = raw_frame->header->cluster_id;
-    (void)src_addr;
-
-    RAW_LOG("[RAW] frame src=0x%04hx cluster=0x%04hx len=%u\n",
-            src_addr, cluster_id, (unsigned)raw_frame->payload_length);
 
     if (cluster_id == CLUSTER_PRIVATE_TUYA && raw_frame->payload_length > 0) {
-        RAW_LOG("[RAW] EF00:");
+        RAW_LOG("[RAW] EF00 src=0x%04hx:",
+                raw_frame->header->src_addr.u.short_addr);
         for (uint16_t i = 0; i < raw_frame->payload_length; i++)
             RAW_LOG(" %02X", raw_frame->payload[i]);
         RAW_LOG("\n");
@@ -1420,6 +1436,15 @@ static bool raw_frame_handler(const ezb_zcl_raw_frame_t *raw_frame)
 
 // ============================================================================
 // WATCHDOG TASK — Scenario 2: sensor goes offline / loses network key
+//
+// DOOR sensors (ZG-102Z/ZA — sleepy battery devices):
+//   Cannot respond to ZCL ReadAttr pings — radio is off when sleeping.
+//   Use time-based staleness: if no data received in
+//   (watchdog_interval_min × DOOR_STALE_CYCLES) minutes → mark offline.
+//   ZG-102Z reports battery ~hourly and IAS on every door open/close.
+//
+// PRESENCE sensors (ZG-204ZV, ZG-205Z/A — mains/always-on):
+//   ZCL ReadAttr ping — radio always on, responds reliably.
 // ============================================================================
 
 #if WATCHDOG_ENABLE
@@ -1430,6 +1455,7 @@ static void sensor_watchdog_task(void *arg)
     uart_hub_config_t cfg;
     uart_master_get_config(&cfg);
 
+    /* Initial delay — give sensors time to rejoin before first health check */
     vTaskDelay(pdMS_TO_TICKS(
         (uint32_t)cfg.watchdog_interval_min * 60UL * 1000UL));
 
@@ -1439,6 +1465,9 @@ static void sensor_watchdog_task(void *arg)
                                 * 60UL * 1000UL;
         uint32_t ping_ms     = (uint32_t)cfg.watchdog_ping_timeout_sec
                                 * 1000UL;
+        /* Door sensor staleness threshold in seconds */
+        time_t door_stale_sec = (time_t)cfg.watchdog_interval_min
+                                 * 60 * DOOR_STALE_CYCLES;
 
         hub_config_t *cc = lock_config();
         int count = cc ? cc->sensor_count : 0;
@@ -1450,14 +1479,70 @@ static void sensor_watchdog_task(void *arg)
             hub_config_t *c = lock_config();
             if (!c) continue;
 
-            bool     online     = c->sensors[i].online;
-            uint16_t short_addr = c->sensors[i].short_addr;
-            uint8_t  ep         = c->sensors[i].endpoint;
-            char     name[SENSOR_NAME_LEN];
+            bool          online     = c->sensors[i].online;
+            uint16_t      short_addr = c->sensors[i].short_addr;
+            uint8_t       ep         = c->sensors[i].endpoint;
+            sensor_role_t role       = (sensor_role_t)c->sensors[i].sensor_role;
+            time_t        last_seen  = c->sensors[i].last_seen;
+            char          name[SENSOR_NAME_LEN];
             strncpy(name, c->sensors[i].sensor_name, SENSOR_NAME_LEN - 1);
             name[SENSOR_NAME_LEN - 1] = '\0';
             unlock_config();
 
+            /* ── DOOR SENSOR: time-based staleness check ── */
+            if (role == ROLE_DOOR) {
+                if (!online) {
+                    /*
+                     * Already offline. Increment miss_count to eventually
+                     * trigger a pairing window for key-loss recovery.
+                     */
+                    g_meta[i].miss_count++;
+                    if (g_meta[i].miss_count >= WATCHDOG_OFFLINE_PAIRING_THRESHOLD) {
+                        PROD_LOG(TAG,
+                                 "[WDG] %s offline for %u cycles — "
+                                 "opening %us pairing window for re-pair",
+                                 name, g_meta[i].miss_count,
+                                 WATCHDOG_PAIRING_REOPEN_SEC);
+                        g_meta[i].miss_count = 0;
+                        uart_cmd_start_pairing(WATCHDOG_PAIRING_REOPEN_SEC);
+                    }
+                } else {
+                    /*
+                     * Door sensor is marked online. Check how long since
+                     * we last heard from it. If longer than the stale
+                     * threshold, mark it offline. No ZCL ping is sent —
+                     * the device is sleeping and would not respond.
+                     */
+                    time_t now_t   = time(NULL);
+                    time_t silence = now_t - last_seen;
+                    if (silence > door_stale_sec) {
+                        hub_config_t *co = lock_config();
+                        if (co) {
+                            co->sensors[i].online = false;
+                            PROD_LOG(TAG,
+                                     "[WDG] %s OFFLINE (no data for %lds, "
+                                     "threshold=%lds)",
+                                     name, (long)silence, (long)door_stale_sec);
+                            update_hub_presence_locked(co);
+                            unlock_config();
+                            mark_dirty();
+                        }
+                        uart_master_send_sensor_health(name, false);
+                        g_meta[i].ping_pending = false;
+                        g_meta[i].miss_count   = 1;
+                    } else {
+                        DEV_LOG(TAG,
+                                "[WDG] %s door — last seen %lds ago (ok, "
+                                "threshold=%lds)",
+                                name, (long)silence, (long)door_stale_sec);
+                        g_meta[i].miss_count = 0;
+                    }
+                }
+                vTaskDelay(pdMS_TO_TICKS(500));
+                continue;
+            }
+
+            /* ── PRESENCE SENSOR: ZCL ping ── */
             if (!online) {
                 g_meta[i].miss_count++;
                 DEV_LOG(TAG, "[WDG] %s already OFFLINE — miss_count=%u/%u",
@@ -1738,7 +1823,6 @@ static void esp_zigbee_stack_main_task(void *pvParameters)
     zigbee_config.device_config.device_type =
         EZB_NWK_DEVICE_TYPE_COORDINATOR;
     zigbee_config.device_config.install_code_policy      = false;
-    /* FIX: was zcpzr_config — correct member is zczr_config */
     zigbee_config.device_config.zczr_config.max_children = MAX_SENSORS;
     zigbee_config.platform_config.storage_partition_name =
         ESP_ZIGBEE_STORAGE_PARTITION_NAME;
