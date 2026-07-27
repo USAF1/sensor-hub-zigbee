@@ -3,11 +3,16 @@
  * Sensor Hub <-> Master UART Communication Layer
  * Innovatsii EMS — Pico 1
  *
+ * Stack overflow fix (2026-07-26):
+ *   uart_tx_task previously declared `tx_msg_t msg` as a local variable.
+ *   With TX_MSG_SIZE=512 this puts 514 bytes on the 2048-byte task stack.
+ *   Combined with uart_write_bytes() internals (~300 bytes) + FreeRTOS
+ *   context (~200 bytes) this overflows the stack at ~29 minutes runtime.
+ *   Fix: s_tx_dequeue_buf is now a static global — never on any stack.
+ *
  * hub_boot retry:
  *   Sends hub_boot every 2 seconds for up to 120 seconds (60 retries).
  *   Stops immediately when Master responds with set_config.
- *   120 second window handles Master WiFi+NTP boot time of ~25 seconds
- *   plus margin for cold start and network delays.
  */
 
 #include "uart_master.h"
@@ -61,14 +66,29 @@ static StackType_t  s_tmr_stack[UART_MASTER_TMR_TASK_STACK];
 static StaticTask_t s_tmr_tcb;
 
 /*
- * hub_boot retry task stack — 3584 bytes.
- * Sized for: tx_send_fmt (256 byte local buf) + vsnprintf internals
- * + debug_print_tx static hex_buf (static, not on stack) + FreeRTOS
- * context + safety margin.
- * DO NOT reduce below 3584.
+ * hub_boot retry task stack — 4096 bytes.
+ * Sized for: tx_send_fmt 512-byte local buf + vsnprintf internals (~200)
+ * + debug_print_tx static hex_buf (NOT on stack) + FreeRTOS context (~200)
+ * + safety margin.
+ * DO NOT reduce below 4096.
  */
 static StackType_t  s_boot_retry_stack[4096];
 static StaticTask_t s_boot_retry_tcb;
+
+/*
+ * Static TX dequeue buffer — NOT on the uart_tx_task stack.
+ *
+ * CRITICAL: Must NOT be a local variable inside uart_tx_task.
+ * With TX_MSG_SIZE=512, a local tx_msg_t is 514 bytes. Combined with
+ * uart_write_bytes() internal stack usage (~300 bytes) and the FreeRTOS
+ * task context save frame (~200 bytes), the total exceeds
+ * UART_MASTER_TX_TASK_STACK (2048 bytes), causing a stack protection
+ * fault at ~29 minutes (first large message sent).
+ *
+ * uart_tx_task is the ONLY consumer of the TX queue so this static buffer
+ * is safe — only one dequeue ever happens at a time.
+ */
+static tx_msg_t s_tx_dequeue_buf;
 
 static char     s_rx_line[UART_MASTER_LINE_BUF_SIZE];
 static uint16_t s_rx_pos = 0;
@@ -109,9 +129,6 @@ static void uptime_str(char *buf, size_t len)
 // ============================================================================
 // RAW TX DEBUG PRINT
 // hex_buf is static — NOT on the stack.
-// debug_print_tx is called from tx_enqueue → tx_send_fmt which already has
-// a 256-byte local buf on the stack. Putting hex_buf on the stack too would
-// overflow hub_boot_retry_task even at 3584 bytes.
 // ============================================================================
 
 static void debug_print_tx(const char *data, uint16_t len)
@@ -275,16 +292,22 @@ static void tx_send_fmt(const char *fmt, ...)
 
 // ============================================================================
 // TX TASK
+//
+// CRITICAL: s_tx_dequeue_buf is STATIC — never on this task's stack.
+// DO NOT change back to a local variable — see declaration above.
 // ============================================================================
 
 static void uart_tx_task(void *arg)
 {
     (void)arg;
-    tx_msg_t msg;
     for (;;) {
-        if (xQueueReceive(s_tx_queue, &msg, portMAX_DELAY) == pdTRUE) {
-            if (msg.len > 0 && msg.len < UART_MASTER_TX_MSG_SIZE)
-                uart_write_bytes(UART_MASTER_PORT, msg.data, msg.len);
+        if (xQueueReceive(s_tx_queue, &s_tx_dequeue_buf, portMAX_DELAY)
+                == pdTRUE) {
+            if (s_tx_dequeue_buf.len > 0 &&
+                s_tx_dequeue_buf.len < UART_MASTER_TX_MSG_SIZE)
+                uart_write_bytes(UART_MASTER_PORT,
+                                 s_tx_dequeue_buf.data,
+                                 s_tx_dequeue_buf.len);
         }
     }
 }
@@ -422,12 +445,7 @@ static void cmd_set_sensor_name(const char *json, uint16_t len)
 static void cmd_set_config(const char *json, uint16_t len)
 {
     (void)len;
-    /*
-     * Master is alive — stop hub_boot retries immediately.
-     * This is the primary signal that the handshake is complete.
-     */
     s_master_config_received = true;
-
     uart_hub_config_t nc;
     uart_master_get_config(&nc);
     int32_t tmp; bool btmp;
@@ -514,7 +532,6 @@ static void cmd_restart(const char *json, uint16_t len)
 
 // ============================================================================
 // RX TASK
-// Prints every raw byte received before noise filter processing.
 // ============================================================================
 
 static void uart_rx_task(void *arg)
@@ -554,9 +571,7 @@ static void uart_rx_task(void *arg)
 
         for (int i = 0; i < bytes; i++) {
             uint8_t b = chunk[i];
-
             if (b == '\r') continue;
-
             if (b == '\n') {
                 if (s_rx_pos > 0) {
                     s_rx_line[s_rx_pos] = '\0';
@@ -572,16 +587,13 @@ static void uart_rx_task(void *arg)
                 }
                 continue;
             }
-
             if (b < 0x20 && b != '\t') {
                 if (s_rx_pos > 0) {
-                    ESP_LOGW(TAG,
-                             "RX: non-printable 0x%02x — line reset", b);
+                    ESP_LOGW(TAG, "RX: non-printable 0x%02x — line reset", b);
                     s_rx_pos = 0;
                 }
                 continue;
             }
-
             if (s_rx_pos >= UART_MASTER_LINE_BUF_SIZE - 1) {
                 ESP_LOGW(TAG, "RX overflow — discarding %u bytes", s_rx_pos);
                 s_rx_pos = 0;
@@ -594,18 +606,6 @@ static void uart_rx_task(void *arg)
 
 // ============================================================================
 // HUB BOOT RETRY TASK
-//
-// Sends hub_boot every 2 seconds for up to 120 seconds (60 retries).
-// Stops immediately when s_master_config_received is set by cmd_set_config.
-//
-// 120 second window rationale:
-//   Master WiFi connect:  up to 30s
-//   NTP sync:             up to 15s (3 retries × 5s)
-//   Total worst case:     ~45s
-//   Retry window:         120s — provides 75s of margin
-//
-// Stack: 3584 bytes — sized for tx_send_fmt local buf + vsnprintf +
-//        FreeRTOS context + safety margin.
 // ============================================================================
 
 static void hub_boot_retry_task(void *arg)
@@ -618,7 +618,6 @@ static void hub_boot_retry_task(void *arg)
 
     for (int attempt = 2; attempt <= 60; attempt++) {
         vTaskDelay(pdMS_TO_TICKS(2000));
-
         if (s_master_config_received) {
             ESP_LOGI(TAG,
                      "hub_boot: Master acknowledged — "
@@ -627,7 +626,6 @@ static void hub_boot_retry_task(void *arg)
             vTaskDelete(NULL);
             return;
         }
-
         uart_master_send_hub_boot();
         ESP_LOGW(TAG, "hub_boot: no set_config yet — retry %d/60", attempt);
     }
@@ -666,12 +664,16 @@ void uart_master_send_hub_ready(void)
         if (c->sensors[i].online) online++; else offline++;
     }
     const char *us = unit_state_str(c->unit_state);
+    bool needs_pairing = (c->sensor_count == 0);
     unlock_config();
     tx_send_fmt("{\"type\":\"hub_ready\",\"online_count\":%d,"
                 "\"offline_count\":%d,\"unit_state\":\"%s\","
-                "\"ts_utc\":\"%s\"}",
-                online, offline, us, ts);
-    ESP_LOGI(TAG, "TX hub_ready online=%d offline=%d", online, offline);
+                "\"needs_pairing\":%s,\"ts_utc\":\"%s\"}",
+                online, offline, us,
+                needs_pairing ? "true" : "false",
+                ts);
+    ESP_LOGI(TAG, "TX hub_ready online=%d offline=%d needs_pairing=%s",
+             online, offline, needs_pairing ? "true" : "false");
 }
 
 void uart_master_send_unit_occupancy(const char *state)
@@ -1031,7 +1033,8 @@ esp_err_t uart_master_init(void)
         return err;
     }
 
-    memset(s_door_alarm, 0, sizeof(s_door_alarm));
+    memset(s_door_alarm,      0, sizeof(s_door_alarm));
+    memset(&s_tx_dequeue_buf, 0, sizeof(s_tx_dequeue_buf));
     s_master_config_received = false;
 
     xTaskCreateStatic(uart_rx_task, "uart_rx",
@@ -1050,8 +1053,8 @@ esp_err_t uart_master_init(void)
                       s_tmr_stack, &s_tmr_tcb);
 
     /*
-     * hub_boot retry task — 3584 byte stack, 60 retries (120s window).
-     * DO NOT reduce stack below 3584 or retry count below 60.
+     * hub_boot retry task — 4096 byte stack, 60 retries (120s window).
+     * DO NOT reduce stack below 4096 or retry count below 60.
      */
     xTaskCreateStatic(hub_boot_retry_task, "hub_boot_retry",
                       4096, NULL,

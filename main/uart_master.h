@@ -2,6 +2,18 @@
  * uart_master.h
  * Sensor Hub <-> Master UART Communication Layer
  * Innovatsii EMS — Pico 1
+ *
+ * Hardware connections:
+ *   ESP32-C6 Sensor Hub:
+ *     GPIO4  = TX → Master GPIO17 (RX)
+ *     GPIO5  = RX ← Master GPIO16 (TX)
+ *     GPIO16, GPIO17 = console UART (do not use for Master comms)
+ *   Master ESP32-S3:
+ *     GPIO16 = TX → Hub GPIO5 (RX)
+ *     GPIO17 = RX ← Hub GPIO4 (TX)
+ *
+ * Baud rate: 9600 — reduced from 115200 for EMI noise immunity
+ *   (802.15.4 Zigbee radio couples onto UART RX pin during TX burst)
  */
 
 #ifndef UART_MASTER_H
@@ -13,10 +25,6 @@
 
 // ============================================================================
 // UART HARDWARE CONFIGURATION
-// ESP32-C6 Sensor Hub:
-//   GPIO16, GPIO17 = console UART (do not use)
-//   GPIO4  = TX to Master RX (GPIO17 on ESP32-S3)
-//   GPIO5  = RX from Master TX (GPIO16 on ESP32-S3)
 // ============================================================================
 
 #define UART_MASTER_PORT     UART_NUM_1
@@ -26,6 +34,18 @@
 
 // ============================================================================
 // BUFFER AND QUEUE SIZING
+//
+// TX_MSG_SIZE = 512:
+//   Needed for config_response with MAX_SENSORS entries.
+//   Each sensor entry is ~80 bytes. Header is ~150 bytes.
+//   2 sensors: 150 + 80 + 80 + 4 (close) = 314 — fits in 512.
+//   15 sensors worst case: 150 + (15 × 80) + 4 = 1354 — truncated
+//   gracefully by the CR() macro's bounds check.
+//
+// TX_MSG_SIZE must match on both Hub and Master sides.
+// Master (MicroPython) uses ujson.dumps() which produces spaced JSON.
+// Hub (C) uses snprintf which produces compact JSON.
+// Both are valid — json field extractors skip whitespace after ':'.
 // ============================================================================
 
 #define UART_MASTER_RX_BUF_SIZE    1024
@@ -35,15 +55,33 @@
 #define UART_MASTER_TX_QUEUE_DEPTH 16
 
 // ============================================================================
-// TASK CONFIGURATION
+// TASK STACK SIZES
+//
+// uart_tx_task:  2048 bytes is sufficient — tx_msg_t dequeue buffer is
+//                now STATIC (s_tx_dequeue_buf), not on the stack.
+//                Without this fix, the 514-byte tx_msg_t local variable
+//                plus uart_write_bytes() internals overflows 2048 bytes,
+//                causing a stack protection fault at ~29 minutes runtime
+//                (when the first large heartbeat message is dequeued).
+//
+// uart_rx_task:  3584 bytes — needs 128-byte chunk buf + 80-byte hex_line
+//                + FreeRTOS context + dispatch_command() call chain.
+//
+// hub_boot_retry: 4096 bytes — calls tx_send_fmt() which has a 512-byte
+//                local buf[TX_MSG_SIZE] on stack + vsnprintf internals
+//                + debug_print_tx() (hex_buf is static, not on stack)
+//                + FreeRTOS context + safety margin.
+//
+// uart_tmr_task: 2560 bytes — calls tx_send_fmt() (512-byte local buf)
+//                + door_alarm and heartbeat call chains.
 // ============================================================================
 
-#define UART_MASTER_RX_TASK_STACK  3584
-#define UART_MASTER_TX_TASK_STACK  2048
-#define UART_MASTER_RX_TASK_PRIO   4
-#define UART_MASTER_TX_TASK_PRIO   4
-#define UART_MASTER_TMR_TASK_STACK 2048
-#define UART_MASTER_TMR_TASK_PRIO  3
+#define UART_MASTER_RX_TASK_STACK   3584
+#define UART_MASTER_TX_TASK_STACK   2048
+#define UART_MASTER_RX_TASK_PRIO    4
+#define UART_MASTER_TX_TASK_PRIO    4
+#define UART_MASTER_TMR_TASK_STACK  2560
+#define UART_MASTER_TMR_TASK_PRIO   3
 
 // ============================================================================
 // CONFIGURABLE PARAMETERS

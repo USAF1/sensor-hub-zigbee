@@ -2,16 +2,12 @@
  * main.h — Sensor Hub Zigbee Coordinator
  * Innovatsii EMS — Pico 1
  *
- * Phase 2 changes vs Phase 1:
- *   - Added sensor_role_t enum (ROLE_DOOR / ROLE_PRESENCE)
- *   - Added unit_occupancy_t enum (UNIT_VACANT / UNIT_OCCUPIED)
- *   - Added sensor_role field to sensor_t
- *   - Added online field to sensor_t (watchdog health tracking)
- *   - Added ping_attempts field to sensor_t
- *   - Removed illuminance_raw from sensor_t (not parsed — too many updates)
- *   - Added unit_state and door_closed_pending to hub_config_t
- *   - Added friendly_name_from_type() declaration (used by uart_master.c)
- *   - Added mark_dirty() declaration (used by uart_hooks.c)
+ * Changes vs previous version:
+ *   - sensor_runtime_meta_t moved here from main.c so uart_hooks.c
+ *     can reference g_meta for the pairing-reopen watchdog path
+ *   - Added miss_count field to sensor_runtime_meta_t
+ *   - Added g_meta extern declaration
+ *   - Added WATCHDOG_OFFLINE_PAIRING_THRESHOLD / WATCHDOG_PAIRING_REOPEN_SEC
  */
 
 #ifndef MAIN_H
@@ -34,6 +30,21 @@
 #define IEEE_ADDR_STR_LEN    24
 #define SENSOR_NAME_LEN      32
 #define COORDINATOR_ENDPOINT 1
+
+/*
+ * Watchdog rejoin / re-pair thresholds.
+ *
+ * WATCHDOG_OFFLINE_PAIRING_THRESHOLD:
+ *   Number of consecutive watchdog cycles a sensor can miss before the
+ *   hub opens a short pairing window.  At watchdog_interval_min=2 the
+ *   default of 3 means ~6 minutes of silence before re-pairing is tried.
+ *
+ * WATCHDOG_PAIRING_REOPEN_SEC:
+ *   Duration in seconds to open the pairing window when the watchdog
+ *   triggers an automatic re-pair attempt.
+ */
+#define WATCHDOG_OFFLINE_PAIRING_THRESHOLD  3
+#define WATCHDOG_PAIRING_REOPEN_SEC         30
 
 // ============================================================================
 // ENUMS
@@ -138,6 +149,34 @@ typedef struct {
     hub_config_t      data;
     SemaphoreHandle_t mutex;
 } hub_config_safe_t;
+
+/*
+ * Per-sensor non-persisted runtime metadata.
+ * Lives in g_meta[] in main.c, rebuilt on every boot from NVS sensor_type.
+ *
+ * miss_count: consecutive watchdog cycles where this sensor did not respond.
+ *   Resets to 0 on successful ping.
+ *   When it reaches WATCHDOG_OFFLINE_PAIRING_THRESHOLD the watchdog opens
+ *   a short pairing window so the sensor can re-pair if its key was lost.
+ */
+typedef struct {
+    bool    model_known;
+    char    model_id[32];
+    bool    bound_once;
+    bool    reporting_configured;
+    bool    enroll_sent;
+    bool    fade_sent;
+    bool    ping_pending;
+    uint8_t rejoin_count;
+    uint8_t miss_count;    /* consecutive offline watchdog cycles */
+} sensor_runtime_meta_t;
+
+// ============================================================================
+// GLOBALS — defined in main.c, declared here for uart_hooks.c access
+// ============================================================================
+
+extern hub_config_safe_t      g_config;
+extern sensor_runtime_meta_t  g_meta[MAX_SENSORS];
 
 // ============================================================================
 // FUNCTION DECLARATIONS
