@@ -83,7 +83,7 @@
 
 #define TAG "SENSOR_HUB"
 
-#define FACTORY_RESET_MODE  0
+#define FACTORY_RESET_MODE  1
 #define RAW_LOGS_MODE       0
 #define WATCHDOG_ENABLE     1
 
@@ -209,7 +209,7 @@ static bool network_formed         = false;
 static bool formation_requested    = false;
 static bool formation_task_started = false;
 static bool zigbee_ready           = false;
-static bool g_dirty                = false;
+static volatile bool g_dirty = false;
 
 // ============================================================================
 // THREAD-SAFE CONFIG ACCESS
