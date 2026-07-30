@@ -1,13 +1,7 @@
 /*
  * main.h — Sensor Hub Zigbee Coordinator
  * Innovatsii EMS — Pico 1
- *
- * Changes vs previous version:
- *   - sensor_runtime_meta_t moved here from main.c so uart_hooks.c
- *     can reference g_meta for the pairing-reopen watchdog path
- *   - Added miss_count field to sensor_runtime_meta_t
- *   - Added g_meta extern declaration
- *   - Added WATCHDOG_OFFLINE_PAIRING_THRESHOLD / WATCHDOG_PAIRING_REOPEN_SEC
+ * Firmware Version: 0.2.5
  */
 
 #ifndef MAIN_H
@@ -19,6 +13,14 @@
 #include "esp_err.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "ezbee/core_types.h"
+
+// ============================================================================
+// FIRMWARE VERSION
+// ============================================================================
+
+#define FIRMWARE_VERSION    "0.2.5"
+#define FIRMWARE_COMPONENT  "sensor_hub"
 
 // ============================================================================
 // CONSTANTS
@@ -31,18 +33,6 @@
 #define SENSOR_NAME_LEN      32
 #define COORDINATOR_ENDPOINT 1
 
-/*
- * Watchdog rejoin / re-pair thresholds.
- *
- * WATCHDOG_OFFLINE_PAIRING_THRESHOLD:
- *   Number of consecutive watchdog cycles a sensor can miss before the
- *   hub opens a short pairing window.  At watchdog_interval_min=2 the
- *   default of 3 means ~6 minutes of silence before re-pairing is tried.
- *
- * WATCHDOG_PAIRING_REOPEN_SEC:
- *   Duration in seconds to open the pairing window when the watchdog
- *   triggers an automatic re-pair attempt.
- */
 #define WATCHDOG_OFFLINE_PAIRING_THRESHOLD  3
 #define WATCHDOG_PAIRING_REOPEN_SEC         30
 
@@ -57,8 +47,8 @@ typedef enum {
 
 typedef enum {
     ROLE_UNASSIGNED = 0,
-    ROLE_DOOR       = 1,   /* ZG-102Z / ZG-102ZA — main entry door   */
-    ROLE_PRESENCE   = 2,   /* ZG-204ZV / ZG-205Z/A — room presence   */
+    ROLE_DOOR       = 1,
+    ROLE_PRESENCE   = 2,
 } sensor_role_t;
 
 typedef enum {
@@ -66,7 +56,6 @@ typedef enum {
     UNIT_OCCUPIED = 1,
 } unit_occupancy_t;
 
-/* Sensor model type — stored as uint8 in sensor_t for NVS round-trip */
 typedef enum {
     SENSOR_UNKNOWN   = 0,
     SENSOR_ZG_204ZV  = 1,
@@ -79,44 +68,22 @@ typedef enum {
 // DATA STRUCTURES
 // ============================================================================
 
-/**
- * @brief Per-sensor persisted and runtime data.
- *
- * ZG-204ZV          : presence (IAS alarm1), temp, humidity, battery
- * ZG-205Z/A         : presence (IAS alarm1 + occupancy attribute)
- * ZG-102Z / ZG-102ZA: contact (IAS alarm1), tamper, battery_low, battery
- *
- * NOTE: illuminance_raw removed — not parsed (too many updates, not needed).
- *       sensor_role added — auto-assigned from model on identification.
- *       online added     — health status managed by watchdog.
- */
 typedef struct {
-    /* Identity */
     char     ieee_addr[IEEE_ADDR_STR_LEN];
     uint16_t short_addr;
     uint8_t  endpoint;
     char     sensor_name[SENSOR_NAME_LEN];
-    uint8_t  sensor_type;       /* sensor_type_t stored as uint8 for NVS  */
-    uint8_t  sensor_role;       /* sensor_role_t stored as uint8 for NVS  */
-
-    /* Health */
-    bool     online;            /* true = actively communicating           */
-    uint8_t  ping_attempts;     /* watchdog retry counter                  */
-
-    /* Presence / contact */
-    bool     presence;          /* ZG-204ZV, ZG-205Z/A: true = occupied    */
-    bool     contact_open;      /* ZG-102Z/A: true = door open             */
+    uint8_t  sensor_type;
+    uint8_t  sensor_role;
+    bool     online;
+    uint8_t  ping_attempts;
+    bool     presence;
+    bool     contact_open;
     bool     tamper;
     bool     battery_low;
-
-    /* Environmental — ZG-204ZV only */
-    int16_t  temperature_cdeg;  /* °C × 100  e.g. 2150 = 21.50 °C         */
-    uint16_t humidity_cpct;     /* % × 100   e.g. 5000 = 50.00 %          */
-
-    /* Battery — ZG-204ZV and ZG-102Z/A */
-    uint8_t  battery_pct;       /* 0–100 % (clamped on write)              */
-
-    /* Timestamps */
+    int16_t  temperature_cdeg;
+    uint16_t humidity_cpct;
+    uint8_t  battery_pct;
     time_t   last_seen;
     time_t   last_change;
 } sensor_t;
@@ -128,21 +95,16 @@ typedef struct {
 } hub_status_t;
 
 typedef struct {
-    /* Unit occupancy state machine */
-    unit_occupancy_t unit_state;           /* VACANT or OCCUPIED              */
-    time_t           unit_state_changed;   /* epoch when state last changed   */
-    bool             door_closed_pending;  /* door closed, awaiting evaluation*/
-
-    /* Hub aggregate presence (raw mmWave OR across all online sensors) */
-    hub_status_t hub_status;
-
-    /* Sensor registry */
-    sensor_t sensors[MAX_SENSORS];
-    uint8_t  sensor_count;
-
-    hub_mode_t mode;
-    bool       pairing_active;
-    time_t     pairing_started;
+    unit_occupancy_t unit_state;
+    time_t           unit_state_changed;
+    bool             door_closed_pending;
+    time_t           door_closed_at;
+    hub_status_t     hub_status;
+    sensor_t         sensors[MAX_SENSORS];
+    uint8_t          sensor_count;
+    hub_mode_t       mode;
+    bool             pairing_active;
+    time_t           pairing_started;
 } hub_config_t;
 
 typedef struct {
@@ -150,15 +112,6 @@ typedef struct {
     SemaphoreHandle_t mutex;
 } hub_config_safe_t;
 
-/*
- * Per-sensor non-persisted runtime metadata.
- * Lives in g_meta[] in main.c, rebuilt on every boot from NVS sensor_type.
- *
- * miss_count: consecutive watchdog cycles where this sensor did not respond.
- *   Resets to 0 on successful ping.
- *   When it reaches WATCHDOG_OFFLINE_PAIRING_THRESHOLD the watchdog opens
- *   a short pairing window so the sensor can re-pair if its key was lost.
- */
 typedef struct {
     bool    model_known;
     char    model_id[32];
@@ -168,37 +121,30 @@ typedef struct {
     bool    fade_sent;
     bool    ping_pending;
     uint8_t rejoin_count;
-    uint8_t miss_count;    /* consecutive offline watchdog cycles */
+    uint8_t miss_count;
+    uint8_t ep_pending;
 } sensor_runtime_meta_t;
 
 // ============================================================================
-// GLOBALS — defined in main.c, declared here for uart_hooks.c access
+// GLOBALS
 // ============================================================================
 
 extern hub_config_safe_t      g_config;
 extern sensor_runtime_meta_t  g_meta[MAX_SENSORS];
+extern volatile bool          g_watchdog_started;
+extern volatile int           g_new_sensor_count;
 
 // ============================================================================
 // FUNCTION DECLARATIONS
 // ============================================================================
 
-/* Thread-safe config access — always unlock after lock */
 hub_config_t *lock_config(void);
 void          unlock_config(void);
-
-/* NVS persistence */
-esp_err_t save_config(hub_config_t *config);
-esp_err_t load_config(hub_config_t *config);
-
-/* Mark config dirty so persist task saves on next tick.
- * Called from main.c and uart_hooks.c */
-void mark_dirty(void);
-
-/* Return human-readable model name string for a sensor type.
- * Used by uart_master.c when building JSON responses. */
-const char *friendly_name_from_type(sensor_type_t t);
-
-/* Unit occupancy state string — "OCCUPIED" or "VACANT" */
-const char *unit_state_str(unit_occupancy_t s);
+esp_err_t     save_config(hub_config_t *config);
+esp_err_t     load_config(hub_config_t *config);
+void          mark_dirty(void);
+const char   *friendly_name_from_type(sensor_type_t t);
+const char   *unit_state_str(unit_occupancy_t s);
+const char   *role_str(sensor_role_t r);
 
 #endif /* MAIN_H */

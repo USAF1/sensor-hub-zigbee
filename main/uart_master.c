@@ -2,10 +2,36 @@
  * uart_master.c
  * Sensor Hub <-> Master UART Communication Layer
  * Innovatsii EMS — Pico 1
+ * Firmware Version: 0.2.5
  *
- * Stack overflow fix: s_tx_dequeue_buf is static global — never on stack.
- * Raw hex debug logging removed — reduces serial noise in production.
- * hub_boot retry: 60 attempts over 120 seconds.
+ * Changes in v0.2.5:
+ *
+ *   BOOT PROTOCOL REDESIGN:
+ *     Hub no longer sends hub_boot spontaneously on boot.
+ *     Hub waits passively for Master to send {"type":"ping"}.
+ *     Hub responds with pong immediately.
+ *     Hub waits for {"type":"hub_init"} which carries full config.
+ *     Hub ACKs hub_init, starts Zigbee, forms network, sends hub_ready.
+ *     After sensor rejoin phase, Hub sends sensor_list_complete.
+ *     Master then sends {"type":"start_watchdog"}.
+ *     Hub ACKs start_watchdog and begins watchdog + data flow.
+ *     Pairing window NEVER opens automatically — only via start_pairing.
+ *
+ *   NEW CONFIG FIELDS:
+ *     presence_fading_time_sec — ZG-204ZV hold time (default 30s)
+ *     door_sensor_max_silence_hours — door silence alert (default 24h)
+ *
+ *   NEW OUTBOUND MESSAGES:
+ *     pong, sensor_joined, sensor_status, sensor_list_complete,
+ *     new_sensor_joined, pairing_complete
+ *
+ *   REMOVED:
+ *     hub_boot_retry_task — replaced by passive ping responder
+ *     Spontaneous hub_boot sending
+ *
+ *   STACK FIX RETAINED:
+ *     s_tx_dequeue_buf remains static global — never on stack.
+ *     DO NOT change back to local variable.
  */
 
 #include "uart_master.h"
@@ -58,14 +84,10 @@ static StaticTask_t s_rx_tcb;
 static StackType_t  s_tmr_stack[UART_MASTER_TMR_TASK_STACK];
 static StaticTask_t s_tmr_tcb;
 
-static StackType_t  s_boot_retry_stack[4096];
-static StaticTask_t s_boot_retry_tcb;
-
 /*
- * Static TX dequeue buffer — NOT on the uart_tx_task stack.
- * CRITICAL: Must NOT be a local variable inside uart_tx_task.
- * With TX_MSG_SIZE=512, a local tx_msg_t is 514 bytes — overflows the
- * 2048-byte task stack causing a crash at ~29 minutes runtime.
+ * CRITICAL: s_tx_dequeue_buf must remain a static global.
+ * A 514-byte local tx_msg_t on the 2048-byte uart_tx_task stack
+ * causes a stack overflow at ~29 minutes runtime.
  */
 static tx_msg_t s_tx_dequeue_buf;
 
@@ -75,8 +97,6 @@ static uint16_t s_rx_pos = 0;
 static SemaphoreHandle_t s_cfg_mutex = NULL;
 static StaticSemaphore_t s_cfg_mutex_cb;
 static uart_hub_config_t s_config;
-
-static volatile bool s_master_config_received = false;
 
 typedef struct {
     bool     door_open;
@@ -101,30 +121,36 @@ static void uptime_str(char *buf, size_t len)
 }
 
 // ============================================================================
-// DEFAULT CONFIG AND VALIDATION
+// DEFAULT CONFIG AND CLAMPING
 // ============================================================================
 
 static const uart_hub_config_t k_defaults = {
-    .pairing_duration_sec      = 120,
-    .watchdog_enable           = true,
-    .watchdog_interval_min     = 60,
-    .watchdog_ping_timeout_sec = 30,
-    .door_alarm_threshold_min  = 10,
-    .heartbeat_interval_min    = 30,
+    .pairing_duration_sec           = 120,
+    .watchdog_enable                = true,
+    .watchdog_interval_min          = 60,
+    .watchdog_ping_timeout_sec      = 30,
+    .door_alarm_threshold_min       = 10,
+    .heartbeat_interval_min         = 30,
+    .presence_fading_time_sec       = 30,
+    .door_sensor_max_silence_hours  = 24,
 };
 
 static void config_clamp(uart_hub_config_t *c)
 {
-    if (c->pairing_duration_sec      < 30  ) c->pairing_duration_sec      = 30;
-    if (c->pairing_duration_sec      > 600 ) c->pairing_duration_sec      = 600;
-    if (c->watchdog_interval_min     < 1   ) c->watchdog_interval_min     = 1;
-    if (c->watchdog_interval_min     > 1440) c->watchdog_interval_min     = 1440;
-    if (c->watchdog_ping_timeout_sec < 10  ) c->watchdog_ping_timeout_sec = 10;
-    if (c->watchdog_ping_timeout_sec > 120 ) c->watchdog_ping_timeout_sec = 120;
-    if (c->door_alarm_threshold_min  < 1   ) c->door_alarm_threshold_min  = 1;
-    if (c->door_alarm_threshold_min  > 60  ) c->door_alarm_threshold_min  = 60;
-    if (c->heartbeat_interval_min    < 1   ) c->heartbeat_interval_min    = 1;
-    if (c->heartbeat_interval_min    > 1440) c->heartbeat_interval_min    = 1440;
+    if (c->pairing_duration_sec           < 30   ) c->pairing_duration_sec           = 30;
+    if (c->pairing_duration_sec           > 600  ) c->pairing_duration_sec           = 600;
+    if (c->watchdog_interval_min          < 1    ) c->watchdog_interval_min          = 1;
+    if (c->watchdog_interval_min          > 1440 ) c->watchdog_interval_min          = 1440;
+    if (c->watchdog_ping_timeout_sec      < 10   ) c->watchdog_ping_timeout_sec      = 10;
+    if (c->watchdog_ping_timeout_sec      > 120  ) c->watchdog_ping_timeout_sec      = 120;
+    if (c->door_alarm_threshold_min       < 1    ) c->door_alarm_threshold_min       = 1;
+    if (c->door_alarm_threshold_min       > 60   ) c->door_alarm_threshold_min       = 60;
+    if (c->heartbeat_interval_min         < 1    ) c->heartbeat_interval_min         = 1;
+    if (c->heartbeat_interval_min         > 1440 ) c->heartbeat_interval_min         = 1440;
+    if (c->presence_fading_time_sec       < 5    ) c->presence_fading_time_sec       = 5;
+    if (c->presence_fading_time_sec       > 300  ) c->presence_fading_time_sec       = 300;
+    if (c->door_sensor_max_silence_hours  < 1    ) c->door_sensor_max_silence_hours  = 1;
+    if (c->door_sensor_max_silence_hours  > 72   ) c->door_sensor_max_silence_hours  = 72;
 }
 
 // ============================================================================
@@ -132,7 +158,7 @@ static void config_clamp(uart_hub_config_t *c)
 // ============================================================================
 
 #define NVS_NS  "uart_hub"
-#define NVS_KEY "cfg_v1"
+#define NVS_KEY "cfg_v2"   /* bumped from v1 — new fields added */
 
 esp_err_t uart_master_load_config(void)
 {
@@ -166,16 +192,10 @@ esp_err_t uart_master_save_config(void)
 {
     nvs_handle_t h;
     esp_err_t err = nvs_open(NVS_NS, NVS_READWRITE, &h);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "NVS open for write failed: %s",
-                 esp_err_to_name(err));
-        return err;
-    }
+    if (err != ESP_OK) return err;
     err = nvs_set_blob(h, NVS_KEY, &s_config, sizeof(uart_hub_config_t));
     if (err == ESP_OK) err = nvs_commit(h);
     nvs_close(h);
-    if (err != ESP_OK)
-        ESP_LOGW(TAG, "UART config save failed: %s", esp_err_to_name(err));
     return err;
 }
 
@@ -186,7 +206,6 @@ void uart_master_get_config(uart_hub_config_t *out)
         *out = s_config;
         xSemaphoreGive(s_cfg_mutex);
     } else {
-        ESP_LOGW(TAG, "get_config: mutex timeout — returning defaults");
         *out = k_defaults;
     }
 }
@@ -194,10 +213,8 @@ void uart_master_get_config(uart_hub_config_t *out)
 esp_err_t uart_master_set_config(const uart_hub_config_t *in)
 {
     if (!in) return ESP_ERR_INVALID_ARG;
-    if (xSemaphoreTake(s_cfg_mutex, pdMS_TO_TICKS(500)) != pdTRUE) {
-        ESP_LOGW(TAG, "set_config: mutex timeout");
+    if (xSemaphoreTake(s_cfg_mutex, pdMS_TO_TICKS(500)) != pdTRUE)
         return ESP_ERR_TIMEOUT;
-    }
     s_config = *in;
     config_clamp(&s_config);
     xSemaphoreGive(s_cfg_mutex);
@@ -205,16 +222,12 @@ esp_err_t uart_master_set_config(const uart_hub_config_t *in)
 }
 
 // ============================================================================
-// TX QUEUE AND SEND HELPERS
+// TX QUEUE AND HELPERS
 // ============================================================================
 
 static void tx_enqueue(const char *data, uint16_t len)
 {
-    if (!s_tx_queue || len == 0 || len >= UART_MASTER_TX_MSG_SIZE) {
-        if (len >= UART_MASTER_TX_MSG_SIZE)
-            ESP_LOGW(TAG, "tx_enqueue: msg too long (%u)", len);
-        return;
-    }
+    if (!s_tx_queue || len == 0 || len >= UART_MASTER_TX_MSG_SIZE) return;
     tx_msg_t msg;
     memcpy(msg.data, data, len);
     msg.data[len] = '\0';
@@ -230,10 +243,7 @@ static void tx_send_fmt(const char *fmt, ...)
     va_start(ap, fmt);
     int n = vsnprintf(buf, sizeof(buf) - 2, fmt, ap);
     va_end(ap);
-    if (n <= 0 || n >= (int)(sizeof(buf) - 2)) {
-        ESP_LOGW(TAG, "tx_send_fmt: truncation or error (n=%d)", n);
-        return;
-    }
+    if (n <= 0 || n >= (int)(sizeof(buf) - 2)) return;
     buf[n]     = '\n';
     buf[n + 1] = '\0';
     tx_enqueue(buf, (uint16_t)(n + 1));
@@ -241,8 +251,7 @@ static void tx_send_fmt(const char *fmt, ...)
 
 // ============================================================================
 // TX TASK
-// s_tx_dequeue_buf is STATIC — never on this task's stack.
-// DO NOT change back to a local variable.
+// s_tx_dequeue_buf MUST remain static — never change to local variable.
 // ============================================================================
 
 static void uart_tx_task(void *arg)
@@ -267,51 +276,83 @@ static void uart_tx_task(void *arg)
 static bool json_str(const char *json, const char *key,
                      char *out, size_t out_sz)
 {
-    char pat[64];
+    char pat[66];
     int n = snprintf(pat, sizeof(pat), "\"%s\":", key);
     if (n <= 0 || n >= (int)sizeof(pat)) return false;
-    const char *p = strstr(json, pat);
-    if (!p) return false;
-    p += strlen(pat);
-    while (*p == ' ' || *p == '\t') p++;
-    if (*p != '"') return false;
-    p++;
-    const char *e = strchr(p, '"');
-    if (!e) return false;
-    size_t len = (size_t)(e - p);
-    if (len >= out_sz) return false;
-    memcpy(out, p, len);
-    out[len] = '\0';
-    return true;
+    /*
+     * Boundary check: the character before the key quote must be
+     * '{', ',', space, or newline. Prevents matching "sensor_name"
+     * when searching for "name".
+     */
+    const char *p = json;
+    while ((p = strstr(p, pat)) != NULL) {
+        if (p > json) {
+            char prev = *(p - 1);
+            if (prev != '{' && prev != ',' && prev != ' ' && prev != '\n') {
+                p++;
+                continue;
+            }
+        }
+        p += strlen(pat);
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p != '"') return false;
+        p++;
+        const char *e = strchr(p, '"');
+        if (!e) return false;
+        size_t len = (size_t)(e - p);
+        if (len >= out_sz) return false;
+        memcpy(out, p, len);
+        out[len] = '\0';
+        return true;
+    }
+    return false;
 }
 
 static bool json_int(const char *json, const char *key, int32_t *out)
 {
-    char pat[64];
+    char pat[66];
     int n = snprintf(pat, sizeof(pat), "\"%s\":", key);
     if (n <= 0 || n >= (int)sizeof(pat)) return false;
-    const char *p = strstr(json, pat);
-    if (!p) return false;
-    p += strlen(pat);
-    while (*p == ' ' || *p == '\t') p++;
-    char *ep;
-    long v = strtol(p, &ep, 10);
-    if (ep == p) return false;
-    *out = (int32_t)v;
-    return true;
+    const char *p = json;
+    while ((p = strstr(p, pat)) != NULL) {
+        if (p > json) {
+            char prev = *(p - 1);
+            if (prev != '{' && prev != ',' && prev != ' ' && prev != '\n') {
+                p++;
+                continue;
+            }
+        }
+        p += strlen(pat);
+        while (*p == ' ' || *p == '\t') p++;
+        char *ep;
+        long v = strtol(p, &ep, 10);
+        if (ep == p) return false;
+        *out = (int32_t)v;
+        return true;
+    }
+    return false;
 }
 
 static bool json_bool(const char *json, const char *key, bool *out)
 {
-    char pat[64];
+    char pat[66];
     int n = snprintf(pat, sizeof(pat), "\"%s\":", key);
     if (n <= 0 || n >= (int)sizeof(pat)) return false;
-    const char *p = strstr(json, pat);
-    if (!p) return false;
-    p += strlen(pat);
-    while (*p == ' ' || *p == '\t') p++;
-    if (strncmp(p, "true",  4) == 0) { *out = true;  return true; }
-    if (strncmp(p, "false", 5) == 0) { *out = false; return true; }
+    const char *p = json;
+    while ((p = strstr(p, pat)) != NULL) {
+        if (p > json) {
+            char prev = *(p - 1);
+            if (prev != '{' && prev != ',' && prev != ' ' && prev != '\n') {
+                p++;
+                continue;
+            }
+        }
+        p += strlen(pat);
+        while (*p == ' ' || *p == '\t') p++;
+        if (strncmp(p, "true",  4) == 0) { *out = true;  return true; }
+        if (strncmp(p, "false", 5) == 0) { *out = false; return true; }
+        return false;
+    }
     return false;
 }
 
@@ -319,6 +360,9 @@ static bool json_bool(const char *json, const char *key, bool *out)
 // COMMAND HANDLERS (inbound from Master)
 // ============================================================================
 
+static void cmd_ping           (const char *json, uint16_t len);
+static void cmd_hub_init       (const char *json, uint16_t len);
+static void cmd_start_watchdog (const char *json, uint16_t len);
 static void cmd_set_sensor_name(const char *json, uint16_t len);
 static void cmd_set_config     (const char *json, uint16_t len);
 static void cmd_get_config     (const char *json, uint16_t len);
@@ -330,6 +374,9 @@ static void cmd_factory_reset  (const char *json, uint16_t len);
 static void cmd_restart        (const char *json, uint16_t len);
 
 static const cmd_entry_t k_cmds[] = {
+    { "ping",            cmd_ping            },
+    { "hub_init",        cmd_hub_init        },
+    { "start_watchdog",  cmd_start_watchdog  },
     { "set_sensor_name", cmd_set_sensor_name },
     { "set_config",      cmd_set_config      },
     { "get_config",      cmd_get_config      },
@@ -358,6 +405,73 @@ static void dispatch_command(const char *json, uint16_t len)
     ESP_LOGW(TAG, "RX: unknown type '%s'", type);
 }
 
+/*
+ * cmd_ping — Master is discovering the Hub.
+ * Respond with pong immediately. Hub was already waiting for this.
+ */
+static void cmd_ping(const char *json, uint16_t len)
+{
+    (void)json; (void)len;
+    uart_master_send_pong();
+    ESP_LOGI(TAG, "ping received — pong sent");
+}
+
+/*
+ * cmd_hub_init — Master is sending full configuration and instructing
+ * Hub to start Zigbee, load NVS sensors, and begin rejoin.
+ *
+ * This command replaces the old hub_boot spontaneous send.
+ * Hub does nothing until this arrives.
+ *
+ * Processing:
+ *   1. ACK immediately
+ *   2. Store config
+ *   3. Set g_hub_init_received flag (main.c checks this to start Zigbee)
+ */
+
+/* Flag checked by main.c Zigbee formation task */
+volatile bool g_hub_init_received = false;
+volatile bool g_hub_init_mode_debug = false;
+
+static void cmd_hub_init(const char *json, uint16_t len)
+{
+    (void)len;
+    uart_master_send_ack("hub_init", true);
+
+    uart_hub_config_t nc;
+    uart_master_get_config(&nc);
+    int32_t tmp; bool btmp;
+    if (json_int(json,  "pairing_duration_sec",          &tmp))  nc.pairing_duration_sec          = (uint16_t)tmp;
+    if (json_bool(json, "watchdog_enable",               &btmp)) nc.watchdog_enable               = btmp;
+    if (json_int(json,  "watchdog_interval_min",         &tmp))  nc.watchdog_interval_min         = (uint16_t)tmp;
+    if (json_int(json,  "watchdog_ping_timeout_sec",     &tmp))  nc.watchdog_ping_timeout_sec     = (uint16_t)tmp;
+    if (json_int(json,  "door_alarm_threshold_min",      &tmp))  nc.door_alarm_threshold_min      = (uint16_t)tmp;
+    if (json_int(json,  "heartbeat_interval_min",        &tmp))  nc.heartbeat_interval_min        = (uint16_t)tmp;
+    if (json_int(json,  "presence_fading_time_sec",      &tmp))  nc.presence_fading_time_sec      = (uint16_t)tmp;
+    if (json_int(json,  "door_sensor_max_silence_hours", &tmp))  nc.door_sensor_max_silence_hours = (uint16_t)tmp;
+    uart_master_set_config(&nc);
+
+    char mode_str[16] = {0};
+    json_str(json, "mode", mode_str, sizeof(mode_str));
+    g_hub_init_mode_debug = (strcmp(mode_str, "debug") == 0);
+
+    g_hub_init_received = true;
+    ESP_LOGI(TAG, "hub_init received — config stored, Zigbee start signalled");
+}
+
+/*
+ * cmd_start_watchdog — Master has confirmed sensor list is complete
+ * and the system is ready. Hub now starts the watchdog and begins
+ * sending sensor data (heartbeat, presence, environment etc).
+ */
+static void cmd_start_watchdog(const char *json, uint16_t len)
+{
+    (void)json; (void)len;
+    g_watchdog_started = true;
+    uart_master_send_ack("start_watchdog", true);
+    ESP_LOGI(TAG, "start_watchdog received — watchdog and data flow active");
+}
+
 static void cmd_set_sensor_name(const char *json, uint16_t len)
 {
     (void)len;
@@ -365,12 +479,10 @@ static void cmd_set_sensor_name(const char *json, uint16_t len)
     char    name[SENSOR_NAME_LEN];
     if (!json_int(json, "sensor_index", &idx) ||
         idx < 0 || idx >= MAX_SENSORS) {
-        ESP_LOGW(TAG, "set_sensor_name: bad index");
         uart_master_send_ack("set_sensor_name", false);
         return;
     }
     if (!json_str(json, "name", name, sizeof(name))) {
-        ESP_LOGW(TAG, "set_sensor_name: missing name");
         uart_master_send_ack("set_sensor_name", false);
         return;
     }
@@ -378,7 +490,6 @@ static void cmd_set_sensor_name(const char *json, uint16_t len)
     if (!c) { uart_master_send_ack("set_sensor_name", false); return; }
     if ((int)idx >= c->sensor_count) {
         unlock_config();
-        ESP_LOGW(TAG, "set_sensor_name: index %ld out of range", (long)idx);
         uart_master_send_ack("set_sensor_name", false);
         return;
     }
@@ -393,16 +504,17 @@ static void cmd_set_sensor_name(const char *json, uint16_t len)
 static void cmd_set_config(const char *json, uint16_t len)
 {
     (void)len;
-    s_master_config_received = true;
     uart_hub_config_t nc;
     uart_master_get_config(&nc);
     int32_t tmp; bool btmp;
-    if (json_int(json,  "pairing_duration_sec",      &tmp))  nc.pairing_duration_sec      = (uint16_t)tmp;
-    if (json_bool(json, "watchdog_enable",            &btmp)) nc.watchdog_enable           = btmp;
-    if (json_int(json,  "watchdog_interval_min",      &tmp))  nc.watchdog_interval_min     = (uint16_t)tmp;
-    if (json_int(json,  "watchdog_ping_timeout_sec",  &tmp))  nc.watchdog_ping_timeout_sec = (uint16_t)tmp;
-    if (json_int(json,  "door_alarm_threshold_min",   &tmp))  nc.door_alarm_threshold_min  = (uint16_t)tmp;
-    if (json_int(json,  "heartbeat_interval_min",     &tmp))  nc.heartbeat_interval_min    = (uint16_t)tmp;
+    if (json_int(json,  "pairing_duration_sec",          &tmp))  nc.pairing_duration_sec          = (uint16_t)tmp;
+    if (json_bool(json, "watchdog_enable",               &btmp)) nc.watchdog_enable               = btmp;
+    if (json_int(json,  "watchdog_interval_min",         &tmp))  nc.watchdog_interval_min         = (uint16_t)tmp;
+    if (json_int(json,  "watchdog_ping_timeout_sec",     &tmp))  nc.watchdog_ping_timeout_sec     = (uint16_t)tmp;
+    if (json_int(json,  "door_alarm_threshold_min",      &tmp))  nc.door_alarm_threshold_min      = (uint16_t)tmp;
+    if (json_int(json,  "heartbeat_interval_min",        &tmp))  nc.heartbeat_interval_min        = (uint16_t)tmp;
+    if (json_int(json,  "presence_fading_time_sec",      &tmp))  nc.presence_fading_time_sec      = (uint16_t)tmp;
+    if (json_int(json,  "door_sensor_max_silence_hours", &tmp))  nc.door_sensor_max_silence_hours = (uint16_t)tmp;
     esp_err_t err = uart_master_set_config(&nc);
     uart_master_send_ack("set_config", err == ESP_OK);
     if (err == ESP_OK) ESP_LOGI(TAG, "Config updated from Master");
@@ -417,7 +529,7 @@ static void cmd_get_config(const char *json, uint16_t len)
 static void cmd_get_logs(const char *json, uint16_t len)
 {
     (void)json; (void)len;
-    uart_master_send_log_response("Log ring buffer — Phase 8");
+    uart_master_send_log_response("Log ring buffer — Phase 9");
     uart_master_send_ack("get_logs", true);
 }
 
@@ -431,6 +543,8 @@ static void cmd_start_pairing(const char *json, uint16_t len)
     uint16_t d = (dur > 0 && dur <= 600)
                  ? (uint16_t)dur : cfg.pairing_duration_sec;
     extern void uart_cmd_start_pairing(uint16_t duration_sec);
+    /* Reset new sensor count before opening window */
+    g_new_sensor_count = 0;
     uart_cmd_start_pairing(d);
     uart_master_send_ack("start_pairing", true);
     ESP_LOGI(TAG, "Pairing opened for %us", (unsigned)d);
@@ -450,7 +564,6 @@ static void cmd_remove_sensor(const char *json, uint16_t len)
     int32_t idx = -1;
     if (!json_int(json, "sensor_index", &idx) ||
         idx < 0 || idx >= MAX_SENSORS) {
-        ESP_LOGW(TAG, "remove_sensor: bad index");
         uart_master_send_ack("remove_sensor", false);
         return;
     }
@@ -480,7 +593,6 @@ static void cmd_restart(const char *json, uint16_t len)
 
 // ============================================================================
 // RX TASK
-// Raw hex logging removed — only JSON commands are logged.
 // ============================================================================
 
 static void uart_rx_task(void *arg)
@@ -491,7 +603,6 @@ static void uart_rx_task(void *arg)
     for (;;) {
         int bytes = uart_read_bytes(UART_MASTER_PORT, chunk,
                                     sizeof(chunk), pdMS_TO_TICKS(20));
-
         for (int i = 0; i < bytes; i++) {
             uint8_t b = chunk[i];
             if (b == '\r') continue;
@@ -528,53 +639,15 @@ static void uart_rx_task(void *arg)
 }
 
 // ============================================================================
-// HUB BOOT RETRY TASK
+// OUTBOUND MESSAGE IMPLEMENTATIONS — Boot Protocol
 // ============================================================================
 
-static void hub_boot_retry_task(void *arg)
-{
-    (void)arg;
-
-    uart_master_send_hub_boot();
-    ESP_LOGI(TAG,
-             "hub_boot: sent (attempt 1/60) — waiting for Master set_config");
-
-    for (int attempt = 2; attempt <= 60; attempt++) {
-        vTaskDelay(pdMS_TO_TICKS(2000));
-        if (s_master_config_received) {
-            ESP_LOGI(TAG,
-                     "hub_boot: Master acknowledged — "
-                     "stopping retries after %d attempt(s)",
-                     attempt - 1);
-            vTaskDelete(NULL);
-            return;
-        }
-        uart_master_send_hub_boot();
-        ESP_LOGW(TAG, "hub_boot: no set_config yet — retry %d/60", attempt);
-    }
-
-    ESP_LOGW(TAG,
-             "hub_boot: Master did not respond after 60 retries (120s) — "
-             "continuing with NVS/default config");
-    vTaskDelete(NULL);
-}
-
-// ============================================================================
-// OUTBOUND MESSAGE IMPLEMENTATIONS
-// ============================================================================
-
-void uart_master_send_hub_boot(void)
+void uart_master_send_pong(void)
 {
     char ts[10]; uptime_str(ts, sizeof(ts));
-    hub_config_t *c = lock_config();
-    if (!c) return;
-    int        count = c->sensor_count;
-    const char *us   = unit_state_str(c->unit_state);
-    unlock_config();
-    tx_send_fmt("{\"type\":\"hub_boot\",\"sensor_count\":%d,"
-                "\"unit_state\":\"%s\",\"ts_utc\":\"%s\"}",
-                count, us, ts);
-    ESP_LOGI(TAG, "TX hub_boot sent");
+    tx_send_fmt("{\"type\":\"pong\",\"firmware_version\":\"%s\","
+                "\"ts_utc\":\"%s\"}",
+                FIRMWARE_VERSION, ts);
 }
 
 void uart_master_send_hub_ready(void)
@@ -586,18 +659,103 @@ void uart_master_send_hub_ready(void)
     for (int i = 0; i < c->sensor_count; i++) {
         if (c->sensors[i].online) online++; else offline++;
     }
-    const char *us = unit_state_str(c->unit_state);
     bool needs_pairing = (c->sensor_count == 0);
+    const char *us = unit_state_str(c->unit_state);
     unlock_config();
-    tx_send_fmt("{\"type\":\"hub_ready\",\"online_count\":%d,"
+    tx_send_fmt("{\"type\":\"hub_ready\",\"firmware_version\":\"%s\","
+                "\"sensor_count\":%d,\"online_count\":%d,"
                 "\"offline_count\":%d,\"unit_state\":\"%s\","
                 "\"needs_pairing\":%s,\"ts_utc\":\"%s\"}",
-                online, offline, us,
-                needs_pairing ? "true" : "false",
-                ts);
+                FIRMWARE_VERSION,
+                online + offline, online, offline, us,
+                needs_pairing ? "true" : "false", ts);
     ESP_LOGI(TAG, "TX hub_ready online=%d offline=%d needs_pairing=%s",
              online, offline, needs_pairing ? "true" : "false");
 }
+
+void uart_master_send_sensor_joined(int         sensor_idx,
+                                    const char *name,
+                                    const char *model,
+                                    const char *role,
+                                    bool        online,
+                                    uint8_t     battery_pct)
+{
+    char ts[10]; uptime_str(ts, sizeof(ts));
+    tx_send_fmt("{\"type\":\"sensor_joined\",\"index\":%d,"
+                "\"name\":\"%s\",\"model\":\"%s\",\"role\":\"%s\","
+                "\"online\":%s,\"battery\":%u,\"ts_utc\":\"%s\"}",
+                sensor_idx,
+                name  ? name  : "",
+                model ? model : "",
+                role  ? role  : "",
+                online ? "true" : "false",
+                (unsigned)battery_pct, ts);
+    ESP_LOGI(TAG, "TX sensor_joined idx=%d name=%s online=%s",
+             sensor_idx, name ? name : "?", online ? "true" : "false");
+}
+
+void uart_master_send_sensor_status(int         sensor_idx,
+                                    const char *name,
+                                    const char *model,
+                                    const char *role,
+                                    bool        online)
+{
+    char ts[10]; uptime_str(ts, sizeof(ts));
+    tx_send_fmt("{\"type\":\"sensor_status\",\"index\":%d,"
+                "\"name\":\"%s\",\"model\":\"%s\",\"role\":\"%s\","
+                "\"online\":%s,\"ts_utc\":\"%s\"}",
+                sensor_idx,
+                name  ? name  : "",
+                model ? model : "",
+                role  ? role  : "",
+                online ? "true" : "false", ts);
+    ESP_LOGI(TAG, "TX sensor_status idx=%d name=%s online=%s",
+             sensor_idx, name ? name : "?", online ? "true" : "false");
+}
+
+void uart_master_send_sensor_list_complete(int total, int online, int offline)
+{
+    char ts[10]; uptime_str(ts, sizeof(ts));
+    tx_send_fmt("{\"type\":\"sensor_list_complete\","
+                "\"total\":%d,\"online\":%d,\"offline\":%d,"
+                "\"ts_utc\":\"%s\"}",
+                total, online, offline, ts);
+    ESP_LOGI(TAG, "TX sensor_list_complete total=%d online=%d offline=%d",
+             total, online, offline);
+}
+
+void uart_master_send_new_sensor_joined(int         sensor_idx,
+                                        const char *name,
+                                        const char *model,
+                                        const char *role)
+{
+    char ts[10]; uptime_str(ts, sizeof(ts));
+    tx_send_fmt("{\"type\":\"new_sensor_joined\",\"index\":%d,"
+                "\"name\":\"%s\",\"model\":\"%s\",\"role\":\"%s\","
+                "\"ts_utc\":\"%s\"}",
+                sensor_idx,
+                name  ? name  : "",
+                model ? model : "",
+                role  ? role  : "",
+                ts);
+    ESP_LOGI(TAG, "TX new_sensor_joined idx=%d name=%s model=%s",
+             sensor_idx, name ? name : "?", model ? model : "?");
+}
+
+void uart_master_send_pairing_complete(int new_sensors, int total_sensors)
+{
+    char ts[10]; uptime_str(ts, sizeof(ts));
+    tx_send_fmt("{\"type\":\"pairing_complete\","
+                "\"new_sensors\":%d,\"total_sensors\":%d,"
+                "\"ts_utc\":\"%s\"}",
+                new_sensors, total_sensors, ts);
+    ESP_LOGI(TAG, "TX pairing_complete new=%d total=%d",
+             new_sensors, total_sensors);
+}
+
+// ============================================================================
+// OUTBOUND MESSAGE IMPLEMENTATIONS — Runtime
+// ============================================================================
 
 void uart_master_send_unit_occupancy(const char *state)
 {
@@ -711,6 +869,9 @@ void uart_master_send_battery(const char *sensor_name, uint8_t battery_pct)
 
 void uart_master_send_heartbeat(void)
 {
+    /* Only send heartbeat after watchdog has been started by Master */
+    if (!g_watchdog_started) return;
+
     char buf[UART_MASTER_TX_MSG_SIZE];
     int  pos = 0;
     int  rem = (int)sizeof(buf) - 2;
@@ -722,11 +883,11 @@ void uart_master_send_heartbeat(void)
 
     char ts[10]; uptime_str(ts, sizeof(ts));
     hub_config_t *c = lock_config();
-    if (!c) { ESP_LOGW(TAG, "heartbeat: lock failed"); return; }
+    if (!c) return;
 
-    HB("{\"type\":\"heartbeat\",\"unit_state\":\"%s\","
-       "\"ts_utc\":\"%s\",\"sensors\":[",
-       unit_state_str(c->unit_state), ts);
+    HB("{\"type\":\"heartbeat\",\"firmware_version\":\"%s\","
+       "\"unit_state\":\"%s\",\"ts_utc\":\"%s\",\"sensors\":[",
+       FIRMWARE_VERSION, unit_state_str(c->unit_state), ts);
 
     for (int i = 0; i < c->sensor_count; i++) {
         sensor_t     *s = &c->sensors[i];
@@ -788,20 +949,26 @@ void uart_master_send_config_response(void)
          if (_n > 0 && (pos + _n) < rem) pos += _n; } while (0)
 
     CR("{\"type\":\"config_response\","
+       "\"firmware_version\":\"%s\","
        "\"pairing_duration_sec\":%u,"
        "\"watchdog_enable\":%s,"
        "\"watchdog_interval_min\":%u,"
        "\"watchdog_ping_timeout_sec\":%u,"
        "\"door_alarm_threshold_min\":%u,"
        "\"heartbeat_interval_min\":%u,"
+       "\"presence_fading_time_sec\":%u,"
+       "\"door_sensor_max_silence_hours\":%u,"
        "\"ts_utc\":\"%s\","
        "\"sensors\":[",
+       FIRMWARE_VERSION,
        cfg.pairing_duration_sec,
        cfg.watchdog_enable ? "true" : "false",
        cfg.watchdog_interval_min,
        cfg.watchdog_ping_timeout_sec,
        cfg.door_alarm_threshold_min,
        cfg.heartbeat_interval_min,
+       cfg.presence_fading_time_sec,
+       cfg.door_sensor_max_silence_hours,
        ts);
 
     hub_config_t *c = lock_config();
@@ -851,7 +1018,7 @@ void uart_master_send_ack(const char *command, bool success)
 }
 
 // ============================================================================
-// TIMER TASK
+// TIMER TASK — door alarm, heartbeat, door silence alert (24h)
 // ============================================================================
 
 static void door_alarm_tick(void)
@@ -879,8 +1046,61 @@ static void door_alarm_tick(void)
     unlock_config();
 }
 
+/*
+ * door_silence_tick — checks every watchdog cycle (not every second)
+ * whether any DOOR sensor has been silent for more than
+ * door_sensor_max_silence_hours. If so, sends HEALTH OFFLINE alert.
+ *
+ * This is separate from the main watchdog task. It runs in uart_timer_task
+ * and checks once per hour (regardless of watchdog_interval_min).
+ */
+static uint32_t s_last_door_silence_check_sec = 0;
+
+static void door_silence_tick(void)
+{
+    uint32_t now = (uint32_t)(esp_timer_get_time() / 1000000ULL);
+
+    /* Check once per hour */
+    if ((now - s_last_door_silence_check_sec) < 3600u) return;
+    s_last_door_silence_check_sec = now;
+
+    uart_hub_config_t cfg;
+    uart_master_get_config(&cfg);
+    time_t silence_threshold = (time_t)cfg.door_sensor_max_silence_hours * 3600;
+
+    hub_config_t *c = lock_config();
+    if (!c) return;
+
+    for (int i = 0; i < c->sensor_count; i++) {
+        sensor_role_t role = (sensor_role_t)c->sensors[i].sensor_role;
+        if (role != ROLE_DOOR) continue;
+        time_t last = c->sensors[i].last_seen;
+        if (last == 0) continue;   /* never seen — skip until first event */
+        time_t silence = time(NULL) - last;
+        if (silence > silence_threshold) {
+            char name[SENSOR_NAME_LEN];
+            strncpy(name, c->sensors[i].sensor_name, SENSOR_NAME_LEN - 1);
+            name[SENSOR_NAME_LEN - 1] = '\0';
+            ESP_LOGW("UART_M",
+                     "[WDG] %s door silent for %ldh (threshold=%uh) — alert",
+                     name, (long)(silence / 3600),
+                     (unsigned)cfg.door_sensor_max_silence_hours);
+            unlock_config();
+            /*
+             * Send HEALTH OFFLINE for notification only.
+             * Does NOT mark sensor offline in registry.
+             * Does NOT open pairing window.
+             */
+            uart_master_send_sensor_health(name, false);
+            return;
+        }
+    }
+    unlock_config();
+}
+
 static void heartbeat_tick(void)
 {
+    if (!g_watchdog_started) return;
     uint32_t now = (uint32_t)(esp_timer_get_time() / 1000000ULL);
     uart_hub_config_t cfg;
     uart_master_get_config(&cfg);
@@ -894,10 +1114,12 @@ static void heartbeat_tick(void)
 static void uart_timer_task(void *arg)
 {
     (void)arg;
-    s_last_heartbeat_sec = (uint32_t)(esp_timer_get_time() / 1000000ULL);
+    s_last_heartbeat_sec         = (uint32_t)(esp_timer_get_time() / 1000000ULL);
+    s_last_door_silence_check_sec = s_last_heartbeat_sec;
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(1000));
         door_alarm_tick();
+        door_silence_tick();
         heartbeat_tick();
     }
 }
@@ -936,36 +1158,26 @@ esp_err_t uart_master_init(void)
 
     esp_err_t err;
     err = uart_param_config(UART_MASTER_PORT, &uc);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "uart_param_config: %s", esp_err_to_name(err));
-        return err;
-    }
+    if (err != ESP_OK) return err;
     err = uart_set_pin(UART_MASTER_PORT,
                        UART_MASTER_TX_PIN, UART_MASTER_RX_PIN,
                        UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "uart_set_pin: %s", esp_err_to_name(err));
-        return err;
-    }
+    if (err != ESP_OK) return err;
     err = uart_driver_install(UART_MASTER_PORT,
                               UART_MASTER_RX_BUF_SIZE,
                               UART_MASTER_TX_BUF_SIZE,
                               0, NULL, 0);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "uart_driver_install: %s", esp_err_to_name(err));
-        return err;
-    }
+    if (err != ESP_OK) return err;
 
     memset(s_door_alarm,      0, sizeof(s_door_alarm));
     memset(&s_tx_dequeue_buf, 0, sizeof(s_tx_dequeue_buf));
-    s_master_config_received = false;
 
-    xTaskCreateStatic(uart_rx_task, "uart_rx",
+    xTaskCreateStatic(uart_rx_task,  "uart_rx",
                       UART_MASTER_RX_TASK_STACK, NULL,
                       UART_MASTER_RX_TASK_PRIO,
                       s_rx_stack, &s_rx_tcb);
 
-    xTaskCreateStatic(uart_tx_task, "uart_tx",
+    xTaskCreateStatic(uart_tx_task,  "uart_tx",
                       UART_MASTER_TX_TASK_STACK, NULL,
                       UART_MASTER_TX_TASK_PRIO,
                       s_tx_stack, &s_tx_tcb);
@@ -975,13 +1187,11 @@ esp_err_t uart_master_init(void)
                       UART_MASTER_TMR_TASK_PRIO,
                       s_tmr_stack, &s_tmr_tcb);
 
-    xTaskCreateStatic(hub_boot_retry_task, "hub_boot_retry",
-                      4096, NULL,
-                      UART_MASTER_TX_TASK_PRIO + 1,
-                      s_boot_retry_stack, &s_boot_retry_tcb);
-
     ESP_LOGI(TAG,
-             "UART Master ready — TX=GPIO%d RX=GPIO%d baud=%d",
-             UART_MASTER_TX_PIN, UART_MASTER_RX_PIN, UART_MASTER_BAUD);
+             "UART Master ready — TX=GPIO%d RX=GPIO%d baud=%d "
+             "fading=%us door_silence=%uh",
+             UART_MASTER_TX_PIN, UART_MASTER_RX_PIN, UART_MASTER_BAUD,
+             s_config.presence_fading_time_sec,
+             s_config.door_sensor_max_silence_hours);
     return ESP_OK;
 }
