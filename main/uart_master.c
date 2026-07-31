@@ -9,10 +9,17 @@
  *     (g_utc_boot_epoch + uptime_seconds, set from hub_init)
  *   - hub_aggregate replaces unit_occupancy
  *   - hub_init now parses utc_epoch field
- *   - presence_fading_time_sec: 0 is valid (no hold — sensor goes NO immediately)
- *   - Sensor joining logic: UNCHANGED
+ *   - presence_fading_time_sec: 0 is valid (no hold)
  *
  * CRITICAL: s_tx_dequeue_buf must remain a static global — never local.
+ *
+ * BUILD FIXES:
+ *   - uptime_str_log removed — was unused, caused -Werror=unused-function
+ *   - tm_year clamped to [2000,2099] before snprintf in utc_str() and
+ *     heartbeat per-sensor timestamp — silences -Werror=format-truncation.
+ *     Without clamping, compiler treats tm_year+1900 as unbounded int and
+ *     calculates worst-case snprintf output as 72 bytes into 24/32 byte buf.
+ *     With year clamped to 4-digit range, max output is 19 chars + null.
  */
 
 #include "uart_master.h"
@@ -82,24 +89,46 @@ typedef struct {
 } door_alarm_t;
 static door_alarm_t s_door_alarm[MAX_SENSORS];
 
-static uint32_t s_last_heartbeat_sec        = 0;
+static uint32_t s_last_heartbeat_sec         = 0;
 static uint32_t s_last_door_silence_check_sec = 0;
 
 // ============================================================================
 // UTC TIMESTAMP HELPER
-//
-// Uses g_utc_boot_epoch (set from hub_init utc_epoch field) plus
-// current uptime seconds to produce a real UTC string.
-// Falls back to uptime format if epoch not yet set.
 // ============================================================================
 
 /* Defined in main.c */
-volatile int64_t g_utc_boot_epoch = 0;
+extern volatile int64_t g_utc_boot_epoch;
 
-/* Uptime in seconds since boot */
 static uint64_t uptime_sec(void)
 {
     return esp_timer_get_time() / 1000000ULL;
+}
+
+/*
+ * fmt_utc_epoch: formats an epoch value into a UTC datetime string.
+ *
+ * Year is clamped to [2000, 2099] before passing to snprintf.
+ * Without clamping the compiler treats tm_year+1900 as an unbounded int
+ * and calculates the worst-case snprintf output as up to 72 bytes —
+ * triggering -Werror=format-truncation regardless of buffer size.
+ * With year clamped to exactly 4 digits, max output is:
+ *   "2099-12-31 23:59:59" = 19 chars + null = 20 bytes.
+ */
+static void fmt_utc_epoch(char *buf, size_t len, int64_t epoch)
+{
+    time_t t = (time_t)epoch;
+    struct tm tm_info;
+    gmtime_r(&t, &tm_info);
+    int year = tm_info.tm_year + 1900;
+    if (year < 2000) year = 2000;
+    if (year > 2099) year = 2099;
+    snprintf(buf, len, "%04d-%02d-%02d %02d:%02d:%02d",
+             year,
+             tm_info.tm_mon  + 1,
+             tm_info.tm_mday,
+             tm_info.tm_hour,
+             tm_info.tm_min,
+             tm_info.tm_sec);
 }
 
 /*
@@ -109,37 +138,15 @@ static uint64_t uptime_sec(void)
 static void utc_str(char *buf, size_t len)
 {
     if (g_utc_boot_epoch > 0) {
-        /* Real UTC: boot_epoch + uptime_seconds */
         int64_t now_epoch = g_utc_boot_epoch + (int64_t)uptime_sec();
-        /* Convert epoch to datetime string */
-        time_t t = (time_t)now_epoch;
-        struct tm tm_info;
-        gmtime_r(&t, &tm_info);
-        snprintf(buf, len, "%04d-%02d-%02d %02d:%02d:%02d",
-                 tm_info.tm_year + 1900,
-                 tm_info.tm_mon  + 1,
-                 tm_info.tm_mday,
-                 tm_info.tm_hour,
-                 tm_info.tm_min,
-                 tm_info.tm_sec);
+        fmt_utc_epoch(buf, len, now_epoch);
     } else {
-        /* Fallback: uptime HH:MM:SS */
         uint64_t sec = uptime_sec();
         snprintf(buf, len, "%02u:%02u:%02u",
                  (unsigned)(sec / 3600),
                  (unsigned)((sec % 3600) / 60),
                  (unsigned)(sec % 60));
     }
-}
-
-/* Keep uptime_str for internal logging that doesn't go to Master */
-static void uptime_str_log(char *buf, size_t len)
-{
-    uint64_t sec = uptime_sec();
-    snprintf(buf, len, "%02u:%02u:%02u",
-             (unsigned)(sec / 3600),
-             (unsigned)((sec % 3600) / 60),
-             (unsigned)(sec % 60));
 }
 
 // ============================================================================
@@ -180,7 +187,7 @@ static void config_clamp(uart_hub_config_t *c)
 // ============================================================================
 
 #define NVS_NS  "uart_hub"
-#define NVS_KEY "cfg_v3"   /* bumped — fading default changed, utc added */
+#define NVS_KEY "cfg_v3"
 
 esp_err_t uart_master_load_config(void)
 {
@@ -457,7 +464,7 @@ static void cmd_hub_init(const char *json, uint16_t len)
     /* Parse utc_epoch — store for real UTC timestamps on all outbound messages */
     int64_t epoch = 0;
     if (json_int64(json, "utc_epoch", &epoch) && epoch > 0) {
-        /* Subtract current uptime so that (epoch + uptime) = real UTC */
+        /* Subtract current uptime so that (g_utc_boot_epoch + uptime) = real UTC */
         g_utc_boot_epoch = epoch - (int64_t)uptime_sec();
         char ts[32];
         utc_str(ts, sizeof(ts));
@@ -774,18 +781,13 @@ void uart_master_send_pairing_complete(int new_sensors, int total_sensors)
 // OUTBOUND — Runtime
 // ============================================================================
 
-/*
- * hub_aggregate: OR of all online presence sensors.
- * No door logic. Pure presence aggregate.
- * Replaces unit_occupancy — Master now owns unit occupancy calculation.
- */
-void uart_master_send_hub_aggregate(const char *state)
+void uart_master_send_hub_aggregate(const char *agg_state)
 {
     char ts[32]; utc_str(ts, sizeof(ts));
     tx_send_fmt("{\"type\":\"hub_aggregate\",\"state\":\"%s\","
                 "\"ts_utc\":\"%s\"}",
-                state ? state : "VACANT", ts);
-    ESP_LOGI(TAG, "TX hub_aggregate=%s", state ? state : "VACANT");
+                agg_state ? agg_state : "VACANT", ts);
+    ESP_LOGI(TAG, "TX hub_aggregate=%s", agg_state ? agg_state : "VACANT");
 }
 
 void uart_master_send_sensor_presence(const char *sensor_name,
@@ -913,17 +915,15 @@ void uart_master_send_heartbeat(void)
         sensor_type_t t = (sensor_type_t)s->sensor_type;
         if (i > 0) HB(",");
 
-        /* Per-sensor UTC timestamp */
+        /*
+         * Per-sensor UTC timestamp.
+         * Uses fmt_utc_epoch() which clamps year to [2000,2099].
+         * Buffer is 32 bytes — well above the 20-byte maximum output.
+         */
         char s_ts[32] = "unknown";
         if (s->last_seen > 0 && g_utc_boot_epoch > 0) {
             int64_t sensor_epoch = g_utc_boot_epoch + (int64_t)s->last_seen;
-            time_t  te = (time_t)sensor_epoch;
-            struct tm tm_info;
-            gmtime_r(&te, &tm_info);
-            snprintf(s_ts, sizeof(s_ts), "%04d-%02d-%02d %02d:%02d:%02d",
-                     tm_info.tm_year + 1900, tm_info.tm_mon + 1,
-                     tm_info.tm_mday,
-                     tm_info.tm_hour, tm_info.tm_min, tm_info.tm_sec);
+            fmt_utc_epoch(s_ts, sizeof(s_ts), sensor_epoch);
         }
 
         if (t == SENSOR_ZG_102Z || t == SENSOR_ZG_102ZA) {

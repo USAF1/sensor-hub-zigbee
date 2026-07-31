@@ -76,7 +76,7 @@
 
 #define TAG "SENSOR_HUB"
 
-#define FACTORY_RESET_MODE  0
+#define FACTORY_RESET_MODE  1
 #define RAW_LOGS_MODE       0
 #define WATCHDOG_ENABLE     1
 
