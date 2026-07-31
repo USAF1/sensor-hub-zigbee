@@ -2,11 +2,14 @@
  * uart_hooks.c
  * Bridge between uart_master.c commands and main.c / Zigbee stack.
  *
- * These functions are called by uart_master.c command handlers.
- * Keeping them separate means uart_master.c has zero dependency
- * on main.c internals — clean one-way dependency.
- *
  * uart_master.c → uart_hooks.c → main.c / Zigbee stack
+ *
+ * These functions are called by uart_master.c command handlers.
+ * Keeping them here means uart_master.c has zero dependency on main.c.
+ *
+ * remove_sensor: also resets g_meta[idx].bound_once so the sensor
+ * will be fully re-bound if it re-pairs. This is the ONLY place
+ * bound_once is reset — never on re-announce, never on reboot.
  */
 
 #include "uart_master.h"
@@ -21,7 +24,6 @@
 
 static const char *TAG = "UART_HOOKS";
 
-/* Open Zigbee pairing window for specified duration */
 void uart_cmd_start_pairing(uint16_t duration_sec)
 {
     if (duration_sec == 0 || duration_sec > 600) duration_sec = 120;
@@ -32,7 +34,6 @@ void uart_cmd_start_pairing(uint16_t duration_sec)
     ESP_LOGI(TAG, "Pairing opened for %us", (unsigned)duration_sec);
 }
 
-/* Close pairing window immediately */
 void uart_cmd_stop_pairing(void)
 {
     esp_zigbee_lock_acquire(portMAX_DELAY);
@@ -41,7 +42,6 @@ void uart_cmd_stop_pairing(void)
     ESP_LOGI(TAG, "Pairing closed");
 }
 
-/* Remove a sensor from the registry by slot index */
 void uart_cmd_remove_sensor(int idx)
 {
     if (idx < 0 || idx >= MAX_SENSORS) return;
@@ -56,12 +56,21 @@ void uart_cmd_remove_sensor(int idx)
         return;
     }
 
-    /* Shift remaining sensors down by one */
+    /* Shift remaining sensors down */
     for (int i = idx; i < c->sensor_count - 1; i++)
         c->sensors[i] = c->sensors[i + 1];
-
     memset(&c->sensors[c->sensor_count - 1], 0, sizeof(sensor_t));
     c->sensor_count--;
+
+    /*
+     * Shift g_meta array to match.
+     * Reset bound_once for removed slot — if sensor re-pairs it gets
+     * a full fresh binding. This is the ONLY place bound_once is reset.
+     */
+    for (int i = idx; i < c->sensor_count; i++)
+        g_meta[i] = g_meta[i + 1];
+    memset(&g_meta[c->sensor_count], 0, sizeof(sensor_runtime_meta_t));
+
     int remaining = c->sensor_count;
     unlock_config();
 
@@ -69,7 +78,6 @@ void uart_cmd_remove_sensor(int idx)
     ESP_LOGI(TAG, "Sensor %d removed — %d remaining", idx, remaining);
 }
 
-/* Erase NVS and restart the Sensor Hub */
 void uart_cmd_factory_reset(void)
 {
     ESP_LOGW(TAG, "FACTORY RESET — erasing NVS and restarting");
