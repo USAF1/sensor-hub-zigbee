@@ -3,13 +3,32 @@
  * Innovatsii EMS — Pico 1
  * Firmware Version: 0.2.5
  *
- * Architecture per V4.2 spec:
- *   - Passive boot: waits for ping from Master, no autonomous Zigbee start
- *   - Sensor identification from bind confirmation + model ID read sequence
- *   - ZG-102Z classified from first IAS zone status if model ID times out
- *   - Door sensor NEVER marked offline by watchdog (sleepy device)
- *   - Presence sensor immediate offline alert
- *   - FACTORY_RESET_MODE = 0 always for production
+ * V4.2+ Architecture — Hub is pure data reporter:
+ *
+ *   Hub responsibilities:
+ *     - Sensor identification (ZG-204ZV, ZG-205Z/A, ZG-102Z)
+ *     - Raw sensor event reporting (presence, door, battery, environment)
+ *     - Hub aggregate = OR of all online presence sensors (no door logic)
+ *     - Real UTC timestamps on all outbound messages
+ *     - Watchdog for always-on sensors
+ *     - Never calculates unit occupancy
+ *
+ *   Master responsibilities (moved from Hub):
+ *     - Unit occupancy calculation from door + presence events
+ *     - Buffer period
+ *     - Booking window + 4-state decision
+ *     - Relay control
+ *
+ *   UTC timestamp:
+ *     Hub receives utc_epoch in hub_init.
+ *     All outbound messages use: utc_epoch + uptime_seconds
+ *
+ *   hub_aggregate:
+ *     Replaces unit_occupancy. Simple OR of online presence sensors.
+ *     No door sensor involvement.
+ *     Sent to Master on every change.
+ *
+ *   Sensor joining logic: UNCHANGED from working version.
  */
 
 #ifndef MAIN_H
@@ -48,18 +67,10 @@
 #define REJOIN_RETRY_DELAY_MS 10000
 #define REJOIN_POLL_GAP_MS    500
 
-/* Occupancy */
-#define DOOR_PENDING_WINDOW_SEC  30
+/* ZG-204ZV fading time default — 0 means no hold (sensor goes NO immediately) */
+#define PRESENCE_FADING_TIME_DEFAULT_SEC 0
 
-/* ZG-204ZV oscillation fix */
-#define PRESENCE_FADING_TIME_DEFAULT_SEC 30
-
-/*
- * MODEL_ID_TIMEOUT_MS:
- *   After bind confirmations arrive, we send the model ID read.
- *   If no response arrives within this window, the sensor is sleepy
- *   (ZG-102Z) and we classify from the first inbound data packet.
- */
+/* Model ID read timeout — ZG-102Z (sleepy) never responds → infer door type */
 #define MODEL_ID_TIMEOUT_MS  5000
 
 // ============================================================================
@@ -78,29 +89,25 @@ typedef enum {
 } sensor_role_t;
 
 typedef enum {
-    UNIT_VACANT   = 0,
-    UNIT_OCCUPIED = 1,
-} unit_occupancy_t;
+    HUB_AGG_VACANT   = 0,
+    HUB_AGG_OCCUPIED = 1,
+} hub_aggregate_t;
 
 typedef enum {
     SENSOR_UNKNOWN   = 0,
-    SENSOR_ZG_204ZV  = 1,   /* mmWave: IAS presence + temp + hum + battery */
-    SENSOR_ZG_205Z_A = 2,   /* mmWave: occupancy sensing + IAS */
-    SENSOR_ZG_102Z   = 3,   /* Door: IAS contact + battery — sleepy */
-    SENSOR_ZG_102ZA  = 4,   /* Door: IAS contact + battery — sleepy */
+    SENSOR_ZG_204ZV  = 1,
+    SENSOR_ZG_205Z_A = 2,
+    SENSOR_ZG_102Z   = 3,
+    SENSOR_ZG_102ZA  = 4,
 } sensor_type_t;
 
-/*
- * Sensor identification state machine.
- * Each sensor progresses through these states after DEVICE_ANNCE.
- */
 typedef enum {
-    ID_STATE_UNIDENTIFIED  = 0,  /* Just joined, EP request not yet sent */
-    ID_STATE_EP_REQUESTED  = 1,  /* Active EP request sent */
-    ID_STATE_BINDING       = 2,  /* Bind requests sent, waiting for confirms */
-    ID_STATE_MODEL_READ    = 3,  /* Bind confirmed, model ID read sent */
-    ID_STATE_IDENTIFIED    = 4,  /* Model known, configure reporting sent */
-    ID_STATE_OPERATIONAL   = 5,  /* All setup complete, data flowing */
+    ID_STATE_UNIDENTIFIED  = 0,
+    ID_STATE_EP_REQUESTED  = 1,
+    ID_STATE_BINDING       = 2,
+    ID_STATE_MODEL_READ    = 3,
+    ID_STATE_IDENTIFIED    = 4,
+    ID_STATE_OPERATIONAL   = 5,
 } sensor_id_state_t;
 
 // ============================================================================
@@ -125,20 +132,19 @@ typedef struct {
     uint8_t  battery_pct;
     time_t   last_seen;
     time_t   last_change;
+    time_t   door_opened_at;   /* epoch when door last went OPEN — for Master */
 } sensor_t;
 
 typedef struct {
-    bool   occupied;
-    time_t timestamp;
-    time_t last_change;
+    hub_aggregate_t  aggregate;    /* OR of all online presence sensors */
+    time_t           timestamp;
+    time_t           last_change;
 } hub_status_t;
 
 typedef struct {
-    unit_occupancy_t unit_state;
-    time_t           unit_state_changed;
-    bool             door_closed_pending;
-    time_t           door_closed_at;
+    /* Hub aggregate — simple presence OR, no door logic */
     hub_status_t     hub_status;
+
     sensor_t         sensors[MAX_SENSORS];
     uint8_t          sensor_count;
     hub_mode_t       mode;
@@ -151,39 +157,28 @@ typedef struct {
     SemaphoreHandle_t mutex;
 } hub_config_safe_t;
 
-/*
- * sensor_runtime_meta_t — volatile per-sensor state.
- * NOT persisted in NVS (reset on boot).
- * All state needed to track identification, binding, and watchdog.
- */
 typedef struct {
-    /* Identification state machine */
     sensor_id_state_t id_state;
-    char              model_id[32];        /* model string from Basic cluster */
-    bool              model_known;         /* true after model identified */
+    char              model_id[32];
+    bool              model_known;
 
-    /* Bind tracking */
-    uint8_t           bind_pending;        /* bind requests sent not yet answered */
-    uint8_t           bind_confirmed;      /* bind responses with status=OK */
-    uint8_t           bind_failed;         /* bind responses with timeout/error */
-    bool              bound_once;          /* IAS+OCC binds completed at least once */
-    bool              power_config_bound;  /* POWER_CONFIG bound after identification */
-    uint8_t           ep_active;           /* endpoint number from active EP response */
+    uint8_t           bind_pending;
+    uint8_t           bind_confirmed;
+    uint8_t           bind_failed;
+    bool              bound_once;
+    bool              power_config_bound;
+    uint8_t           ep_active;
 
-    /* Post-identification setup */
     bool              reporting_configured;
     bool              fade_sent;
 
-    /* Model ID read timeout tracking */
-    uint32_t          model_id_req_ms;     /* esp_timer ms when model ID was requested */
-    bool              model_id_pending;    /* model ID read sent, waiting for response */
+    uint32_t          model_id_req_ms;
+    bool              model_id_pending;
 
-    /* Watchdog */
     bool              ping_pending;
     uint8_t           miss_count;
     uint8_t           rejoin_count;
 
-    /* IAS zone enroll */
     bool              enroll_sent;
 } sensor_runtime_meta_t;
 
@@ -196,6 +191,9 @@ extern sensor_runtime_meta_t  g_meta[MAX_SENSORS];
 extern volatile bool          g_watchdog_started;
 extern volatile int           g_new_sensor_count;
 
+/* UTC epoch received from Master in hub_init — used for real timestamps */
+extern volatile int64_t       g_utc_boot_epoch;
+
 // ============================================================================
 // FUNCTION DECLARATIONS
 // ============================================================================
@@ -206,7 +204,7 @@ esp_err_t     save_config(hub_config_t *config);
 esp_err_t     load_config(hub_config_t *config);
 void          mark_dirty(void);
 const char   *friendly_name_from_type(sensor_type_t t);
-const char   *unit_state_str(unit_occupancy_t s);
+const char   *hub_aggregate_str(hub_aggregate_t a);
 const char   *role_str(sensor_role_t r);
 
 #endif /* MAIN_H */
