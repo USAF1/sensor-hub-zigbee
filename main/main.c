@@ -1,29 +1,17 @@
 /*
  * main.c — Sensor Hub Zigbee Coordinator
- * Innovatsii EMS — Pico 1
- * Firmware Version: 0.2.5
+ * Innovatsii EMS — Pico 1  |  Firmware 0.2.5
  *
- * V4.2+ Architecture — Hub is pure data reporter:
+ * Hub is a pure data reporter:
+ *   - Identifies sensors (ZG-204ZV, ZG-205Z/A, ZG-102Z/ZA)
+ *   - Reports presence, door, battery, environment, health to Master
+ *   - hub_aggregate = OR of online presence sensors (no door logic)
+ *   - Persists sensors in NVS; rejoins them on reboot
+ *   - Watchdog for always-on presence sensors; door sensors never offline
  *
- *   REMOVED from Hub:
- *     - evaluate_unit_occupancy_locked() — Master now owns this
- *     - unit_state field from hub_config_t
- *     - door_closed_pending / door_closed_at
- *     - uart_master_send_unit_occupancy() calls
- *
- *   ADDED to Hub:
- *     - update_hub_aggregate_locked() — OR of all online presence sensors
- *     - uart_master_send_hub_aggregate() — emitted on every aggregate change
- *     - g_utc_boot_epoch — real UTC from hub_init, used in timestamps
- *
- *   UNCHANGED:
- *     - All sensor joining, binding, identification logic
- *     - ZG-102Z fallback identification
- *     - ZG-204ZV fading time (now defaults to 0)
- *     - Watchdog for always-on sensors
- *     - Door sensor never marked offline
- *     - NVS persistence
- *     - Rejoin task with static arrays
+ * Presence/contact state is decoded from standard Zigbee clusters
+ * (IAS Zone 0x0500, Occupancy 0x0406), confirmed against live sensor
+ * captures. Tuya EF00 traffic is telemetry only and is ignored.
  */
 
 #include <stdio.h>
@@ -66,16 +54,13 @@
 #include "uart_master.h"
 #include "zigbee_gateway.h"
 
-// ============================================================================
-// COMPILE-TIME FLAGS
-// ============================================================================
-
 #ifndef ESP_ZIGBEE_STORAGE_PARTITION_NAME
 #define ESP_ZIGBEE_STORAGE_PARTITION_NAME "zb_storage"
 #endif
 
 #define TAG "SENSOR_HUB"
 
+/* Production: sensors must persist across reboots so rejoin can run. */
 #define FACTORY_RESET_MODE  1
 #define RAW_LOGS_MODE       0
 #define WATCHDOG_ENABLE     1
@@ -83,55 +68,9 @@
 #define ZIGBEE_PRIMARY_CHANNEL_MASK   0x07FFF800UL
 #define ZIGBEE_SECONDARY_CHANNEL_MASK 0x00000000UL
 
-#define REJOIN_RETRY_COUNT    6
-#define REJOIN_RETRY_DELAY_MS 10000
-#define REJOIN_POLL_GAP_MS    500
+#define MODEL_ID_TIMEOUT_MS 5000
 
-#define MODEL_ID_TIMEOUT_MS              5000
-#define PRESENCE_FADING_TIME_DEFAULT_SEC 0
-
-// ============================================================================
-// LOGGING
-// ============================================================================
-
-static void uptime_str(char *buf, size_t len)
-{
-    uint64_t sec = esp_timer_get_time() / 1000000ULL;
-    snprintf(buf, len, "%02u:%02u:%02u",
-             (unsigned)(sec / 3600),
-             (unsigned)((sec % 3600) / 60),
-             (unsigned)(sec % 60));
-}
-
-#define PROD_LOG(tag, fmt, ...) do {                             \
-    char _ts[10]; uptime_str(_ts, sizeof(_ts));                  \
-    ESP_LOGI(tag, "[%s] " fmt, _ts, ##__VA_ARGS__);             \
-} while (0)
-
-#if RAW_LOGS_MODE
-  #define RAW_LOG(...)           printf(__VA_ARGS__)
-  #define DEV_LOG(tag, fmt, ...) ESP_LOGI(tag, fmt, ##__VA_ARGS__)
-#else
-  #define RAW_LOG(...)           do {} while (0)
-  #define DEV_LOG(tag, fmt, ...) do {} while (0)
-#endif
-
-// ============================================================================
-// FORWARD DECLARATIONS
-// ============================================================================
-
-extern void uart_cmd_start_pairing(uint16_t duration_sec);
-extern void uart_cmd_stop_pairing(void);
-extern void uart_cmd_remove_sensor(int idx);
-extern void uart_cmd_factory_reset(void);
-
-extern volatile bool    g_hub_init_received;
-extern volatile bool    g_hub_init_mode_debug;
-
-// ============================================================================
-// ZCL CLUSTER / ATTRIBUTE IDs
-// ============================================================================
-
+/* ZCL cluster / attribute IDs */
 #define CLUSTER_BASIC              0x0000
 #define CLUSTER_POWER_CONFIG       0x0001
 #define CLUSTER_ILLUMINANCE        0x0400
@@ -141,16 +80,15 @@ extern volatile bool    g_hub_init_mode_debug;
 #define CLUSTER_IAS_ZONE           0x0500
 #define CLUSTER_PRIVATE_TUYA       0xEF00
 
-#define ATTR_BASIC_ZCL_VERSION        0x0000
-#define ATTR_BASIC_MANUFACTURER_NAME  0x0004
-#define ATTR_BASIC_MODEL_IDENTIFIER   0x0005
-#define ATTR_TEMPERATURE_MEASURED     0x0000
-#define ATTR_HUMIDITY_MEASURED        0x0000
-#define ATTR_OCCUPANCY                0x0000
-#define ATTR_IAS_ZONE_STATUS          0x0002
-#define ATTR_BATTERY_PERCENT          0x0021
+#define ATTR_BASIC_ZCL_VERSION       0x0000
+#define ATTR_BASIC_MODEL_IDENTIFIER  0x0005
+#define ATTR_TEMPERATURE_MEASURED    0x0000
+#define ATTR_HUMIDITY_MEASURED       0x0000
+#define ATTR_OCCUPANCY               0x0000
+#define ATTR_IAS_ZONE_STATUS         0x0002
+#define ATTR_BATTERY_PERCENT         0x0021
 
-#define TUYA_DP_FADING_TIME  0x66
+#define TUYA_DP_FADING_TIME 0x66
 
 static const uint16_t k_initial_bind_clusters[] = {
     CLUSTER_IAS_ZONE,
@@ -159,9 +97,33 @@ static const uint16_t k_initial_bind_clusters[] = {
 #define INITIAL_BIND_COUNT \
     (sizeof(k_initial_bind_clusters) / sizeof(k_initial_bind_clusters[0]))
 
-// ============================================================================
-// MODEL DEFINITIONS
-// ============================================================================
+/* Logging with uptime prefix */
+static void uptime_str(char *buf, size_t len)
+{
+    uint64_t sec = esp_timer_get_time() / 1000000ULL;
+    snprintf(buf, len, "%02u:%02u:%02u",
+             (unsigned)(sec / 3600),
+             (unsigned)((sec % 3600) / 60),
+             (unsigned)(sec % 60));
+}
+
+#define PROD_LOG(tag, fmt, ...) do {                 \
+    char _ts[10]; uptime_str(_ts, sizeof(_ts));      \
+    ESP_LOGI(tag, "[%s] " fmt, _ts, ##__VA_ARGS__);  \
+} while (0)
+
+#if RAW_LOGS_MODE
+  #define RAW_LOG(...) printf(__VA_ARGS__)
+#else
+  #define RAW_LOG(...) do {} while (0)
+#endif
+
+extern void uart_cmd_start_pairing(uint16_t duration_sec);
+extern void uart_cmd_stop_pairing(void);
+extern void uart_cmd_remove_sensor(int idx);
+extern void uart_cmd_factory_reset(void);
+extern volatile bool g_hub_init_received;
+extern volatile bool g_hub_init_mode_debug;
 
 typedef struct {
     const char   *model_id;
@@ -201,27 +163,19 @@ const char *role_str(sensor_role_t r)
     }
 }
 
-// ============================================================================
-// GLOBALS
-// ============================================================================
-
-hub_config_safe_t            g_config            = {0};
-sensor_runtime_meta_t        g_meta[MAX_SENSORS]  = {0};
-volatile bool                g_watchdog_started   = false;
-volatile int                 g_new_sensor_count   = 0;
-volatile int64_t             g_utc_boot_epoch     = 0;
+hub_config_safe_t     g_config           = {0};
+sensor_runtime_meta_t g_meta[MAX_SENSORS] = {0};
+volatile bool         g_watchdog_started  = false;
+volatile int          g_new_sensor_count  = 0;
+volatile int64_t      g_utc_boot_epoch    = 0;
 
 static bool pairing_active         = false;
 static bool pairing_window_expired = false;
 static bool network_formed         = false;
 static bool formation_requested    = false;
 static bool formation_task_started = false;
-static volatile bool g_dirty       = false;
+static volatile bool g_dirty          = false;
 static volatile bool g_rejoin_complete = false;
-
-// ============================================================================
-// THREAD-SAFE CONFIG ACCESS
-// ============================================================================
 
 hub_config_t *lock_config(void)
 {
@@ -239,10 +193,6 @@ void unlock_config(void)
 
 void mark_dirty(void) { g_dirty = true; }
 
-// ============================================================================
-// HELPERS
-// ============================================================================
-
 static const sensor_model_def_t *find_model_def(const char *model_id)
 {
     for (size_t i = 0;
@@ -257,20 +207,35 @@ static int find_sensor_index_by_short(uint16_t short_addr)
 {
     hub_config_t *c = lock_config();
     if (!c) return -1;
+    int found = -1;
     for (int i = 0; i < c->sensor_count; i++) {
-        if (c->sensors[i].short_addr == short_addr) {
-            unlock_config();
-            return i;
-        }
+        if (c->sensors[i].short_addr == short_addr) { found = i; break; }
     }
     unlock_config();
-    return -1;
+    return found;
 }
 
 static void set_default_sensor_name(sensor_t *s, int idx)
 {
     if (s->sensor_name[0] == '\0')
         snprintf(s->sensor_name, SENSOR_NAME_LEN, "Sensor_%d", idx + 1);
+}
+
+static void reset_meta_runtime(int i)
+{
+    g_meta[i].miss_count           = 0;
+    g_meta[i].reporting_configured = false;
+    g_meta[i].fade_sent            = false;
+    g_meta[i].bound_once           = false;
+    g_meta[i].power_config_bound   = false;
+    g_meta[i].enroll_sent          = false;
+    g_meta[i].ep_active            = 1;
+    g_meta[i].bind_pending         = 0;
+    g_meta[i].bind_confirmed       = 0;
+    g_meta[i].bind_failed          = 0;
+    g_meta[i].model_id_pending     = false;
+    g_meta[i].model_id_req_ms      = 0;
+    g_meta[i].ping_pending         = false;
 }
 
 static void restore_meta_from_nvs(hub_config_t *config)
@@ -289,30 +254,12 @@ static void restore_meta_from_nvs(hub_config_t *config)
                 }
             }
         }
-        g_meta[i].miss_count            = 0;
-        g_meta[i].reporting_configured  = false;
-        g_meta[i].fade_sent             = false;
-        g_meta[i].bound_once            = false;
-        g_meta[i].power_config_bound    = false;
-        g_meta[i].enroll_sent           = false;
-        g_meta[i].ep_active             = 1;
-        g_meta[i].bind_pending          = 0;
-        g_meta[i].bind_confirmed        = 0;
-        g_meta[i].bind_failed           = 0;
-        g_meta[i].model_id_pending      = false;
-        g_meta[i].model_id_req_ms       = 0;
-        g_meta[i].ping_pending          = false;
+        reset_meta_runtime(i);
     }
 }
 
-// ============================================================================
-// HUB AGGREGATE — OR of all online presence sensors
-//
-// This is the ONLY thing the Hub calculates. No door logic. No unit occupancy.
-// Called with config lock HELD.
-// Emits hub_aggregate to Master when the aggregate state changes.
-// ============================================================================
-
+/* Hub aggregate — OR of online presence sensors, door sensors excluded.
+ * Called with config lock HELD. Emits to Master only on change. */
 static void update_hub_aggregate_locked(hub_config_t *c)
 {
     bool any_occupied = false;
@@ -330,27 +277,11 @@ static void update_hub_aggregate_locked(hub_config_t *c)
         c->hub_status.last_change = time(NULL);
         c->hub_status.aggregate   = new_agg;
         c->hub_status.timestamp   = time(NULL);
-        PROD_LOG(TAG, "[HUB] aggregate=%s",
-                 hub_aggregate_str(new_agg));
-        /* Emit to Master — Master uses this + door events for unit occupancy */
+        PROD_LOG(TAG, "[HUB] aggregate=%s", hub_aggregate_str(new_agg));
         uart_master_send_hub_aggregate(hub_aggregate_str(new_agg));
     } else {
         c->hub_status.timestamp = time(NULL);
     }
-}
-
-// ============================================================================
-// DISPLAY
-// ============================================================================
-
-static void print_banner(void)
-{
-    printf("\n\n");
-    printf("╔══════════════════════════════════════════════════════════════╗\n");
-    printf("║  INNOVATSII EMS - SENSOR HUB  v%-6s  Pico 1 Phase 2.5    ║\n",
-           FIRMWARE_VERSION);
-    printf("╚══════════════════════════════════════════════════════════════╝\n");
-    fflush(stdout);
 }
 
 static void print_sensor_summary(void)
@@ -361,58 +292,29 @@ static void print_sensor_summary(void)
     char ts[10];
     uptime_str(ts, sizeof(ts));
 
-    printf("\n╔══════════════════════════════════════════════════════════════╗\n");
-    printf("║ [%s] SENSOR REGISTRY (%d/%d)  Hub Aggregate: %-8s\n",
+    printf("\n[%s] SENSOR REGISTRY (%d/%d)  Hub Aggregate: %s\n",
            ts, c->sensor_count, MAX_SENSORS,
            hub_aggregate_str(c->hub_status.aggregate));
-    printf("║ Network: %s | Pairing: %s | Watchdog: %s\n",
-           network_formed     ? "ACTIVE"   : "FORMING",
-           pairing_active     ? "OPEN"     : "CLOSED",
-           g_watchdog_started ? "STARTED"  : "WAITING");
-    printf("╚══════════════════════════════════════════════════════════════╝\n");
+    printf("Network:%s Pairing:%s Watchdog:%s\n",
+           network_formed     ? "ACTIVE"  : "FORMING",
+           pairing_active     ? "OPEN"    : "CLOSED",
+           g_watchdog_started ? "STARTED" : "WAITING");
 
     for (int i = 0; i < c->sensor_count; i++) {
-        sensor_t     *s      = &c->sensors[i];
-        sensor_type_t t      = (sensor_type_t)s->sensor_type;
-        sensor_role_t r      = (sensor_role_t)s->sensor_role;
-        const char   *status = s->online ? "[ONLINE] " : "[OFFLINE]";
-
-        printf("  [%d] %-20s %s %-10s %-8s IEEE=%-23s Short=0x%04hx\n",
-               i + 1, s->sensor_name, status,
+        sensor_t     *s = &c->sensors[i];
+        sensor_type_t t = (sensor_type_t)s->sensor_type;
+        sensor_role_t r = (sensor_role_t)s->sensor_role;
+        printf("  [%d] %-16s %-9s %-8s %-8s IEEE=%s Short=0x%04hx\n",
+               i + 1, s->sensor_name,
+               s->online ? "[ONLINE]" : "[OFFLINE]",
                friendly_name_from_type(t), role_str(r),
                s->ieee_addr, s->short_addr);
-
-        if (t == SENSOR_ZG_204ZV) {
-            printf("        presence=%-3s  temp=%.1f°C  hum=%.1f%%"
-                   "  batt=%u%%  tamper=%s\n",
-                   s->presence ? "YES" : "NO",
-                   (double)s->temperature_cdeg / 100.0,
-                   (double)s->humidity_cpct    / 100.0,
-                   s->battery_pct, s->tamper ? "YES" : "NO");
-        } else if (t == SENSOR_ZG_205Z_A) {
-            printf("        presence=%-3s  tamper=%s\n",
-                   s->presence ? "YES" : "NO",
-                   s->tamper   ? "YES" : "NO");
-        } else if (t == SENSOR_ZG_102Z || t == SENSOR_ZG_102ZA) {
-            printf("        contact=%-6s  batt=%u%%  tamper=%s  batt_low=%s\n",
-                   s->contact_open ? "OPEN" : "CLOSED",
-                   s->battery_pct,
-                   s->tamper      ? "YES" : "NO",
-                   s->battery_low ? "YES" : "NO");
-        } else {
-            printf("        (identifying...)\n");
-        }
     }
-    printf("\n  Hub Aggregate : %s\n",
-           hub_aggregate_str(c->hub_status.aggregate));
     unlock_config();
     fflush(stdout);
 }
 
-// ============================================================================
-// NVS PERSISTENCE
-// ============================================================================
-
+/* NVS persistence */
 esp_err_t save_config(hub_config_t *config)
 {
     if (!config) return ESP_ERR_INVALID_ARG;
@@ -423,7 +325,7 @@ esp_err_t save_config(hub_config_t *config)
 
     nvs_set_u8(handle, "mode",           (uint8_t)config->mode);
     nvs_set_u8(handle, "sensor_count",   config->sensor_count);
-    nvs_set_u8(handle, "pairing_active", config->pairing_active  ? 1 : 0);
+    nvs_set_u8(handle, "pairing_active", config->pairing_active ? 1 : 0);
     nvs_set_u8(handle, "hub_agg",        (uint8_t)config->hub_status.aggregate);
 
     for (int i = 0; i < config->sensor_count; i++) {
@@ -446,13 +348,13 @@ esp_err_t load_config(hub_config_t *config)
     nvs_handle_t handle;
     esp_err_t err = nvs_open("sensor_hub", NVS_READONLY, &handle);
     if (err == ESP_ERR_NVS_NOT_FOUND) {
-        config->mode                     = MODE_PAIRING;
-        config->sensor_count             = 0;
-        config->pairing_active           = false;
-        config->pairing_started          = time(NULL);
-        config->hub_status.aggregate     = HUB_AGG_VACANT;
-        config->hub_status.timestamp     = 0;
-        config->hub_status.last_change   = 0;
+        config->mode                   = MODE_PAIRING;
+        config->sensor_count           = 0;
+        config->pairing_active         = false;
+        config->pairing_started        = time(NULL);
+        config->hub_status.aggregate   = HUB_AGG_VACANT;
+        config->hub_status.timestamp   = 0;
+        config->hub_status.last_change = 0;
         PROD_LOG(TAG, "NVS empty — waiting for hub_init");
         return ESP_OK;
     }
@@ -466,13 +368,10 @@ esp_err_t load_config(hub_config_t *config)
     nvs_get_u8(handle, "pairing_active", &pa);
     config->pairing_active = (pa != 0);
 
-    uint8_t agg = 0;
-    nvs_get_u8(handle, "hub_agg", &agg);
-    /* Always start VACANT on boot — sensors are all offline until they rejoin */
+    /* Boot always starts VACANT — sensors are offline until they rejoin. */
     config->hub_status.aggregate   = HUB_AGG_VACANT;
     config->hub_status.timestamp   = 0;
     config->hub_status.last_change = 0;
-    (void)agg; /* persisted but not restored — boot always starts VACANT */
 
     uint8_t sensor_count = 0;
     nvs_get_u8(handle, "sensor_count", &sensor_count);
@@ -494,12 +393,8 @@ esp_err_t load_config(hub_config_t *config)
     return ESP_OK;
 }
 
-// ============================================================================
-// SENSOR REGISTRY  — UNCHANGED from working version
-// ============================================================================
-
 static void register_or_update_joined_sensor(uint16_t short_addr,
-                                              const char *ieee)
+                                             const char *ieee)
 {
     hub_config_t *c = lock_config();
     if (!c) return;
@@ -522,26 +417,16 @@ static void register_or_update_joined_sensor(uint16_t short_addr,
         memset(&c->sensors[idx], 0, sizeof(sensor_t));
         memset(&g_meta[idx],     0, sizeof(sensor_runtime_meta_t));
     } else {
-        g_meta[idx].reporting_configured = false;
-        g_meta[idx].fade_sent            = false;
-        g_meta[idx].power_config_bound   = false;
-        g_meta[idx].enroll_sent          = false;
-        g_meta[idx].ping_pending         = false;
-        g_meta[idx].miss_count           = 0;
-        g_meta[idx].bind_pending         = 0;
-        g_meta[idx].bind_confirmed       = 0;
-        g_meta[idx].bind_failed          = 0;
-        g_meta[idx].model_id_pending     = false;
-        g_meta[idx].model_id_req_ms      = 0;
-        c->sensors[idx].presence         = false;
+        reset_meta_runtime(idx);
+        c->sensors[idx].presence = false;
     }
 
     c->sensors[idx].short_addr = short_addr;
     strncpy(c->sensors[idx].ieee_addr, ieee, IEEE_ADDR_STR_LEN - 1);
     c->sensors[idx].ieee_addr[IEEE_ADDR_STR_LEN - 1] = '\0';
-    c->sensors[idx].endpoint   = 1;
-    c->sensors[idx].last_seen  = (time_t)(esp_timer_get_time() / 1000000ULL);
-    c->sensors[idx].online     = true;
+    c->sensors[idx].endpoint       = 1;
+    c->sensors[idx].last_seen      = (time_t)(esp_timer_get_time() / 1000000ULL);
+    c->sensors[idx].online         = true;
     c->sensors[idx].door_opened_at = 0;
     set_default_sensor_name(&c->sensors[idx], idx);
 
@@ -549,8 +434,7 @@ static void register_or_update_joined_sensor(uint16_t short_addr,
         sensor_t *s = &c->sensors[idx];
         unlock_config();
         uart_master_send_new_sensor_joined(
-            idx,
-            s->sensor_name,
+            idx, s->sensor_name,
             friendly_name_from_type((sensor_type_t)s->sensor_type),
             role_str((sensor_role_t)s->sensor_role));
         g_new_sensor_count++;
@@ -562,16 +446,12 @@ static void register_or_update_joined_sensor(uint16_t short_addr,
     mark_dirty();
 }
 
-// ============================================================================
-// FADING TIME TASK — file scope (C does not allow nested functions)
-// ============================================================================
-
+/* Fading time write (Tuya EF00 DP). Runs off-stack to avoid blocking. */
 typedef struct { uint16_t sa; uint8_t ep; uint32_t fs; } fade_args_t;
 
 static void fade_task(void *arg)
 {
     fade_args_t *x = (fade_args_t *)arg;
-
     vTaskDelay(pdMS_TO_TICKS(2000));
 
     uint8_t payload[] = {
@@ -594,18 +474,15 @@ static void fade_task(void *arg)
     cmd.data_length                    = sizeof(payload);
     cmd.data                           = payload;
 
+    esp_zigbee_lock_acquire(portMAX_DELAY);
     (void)ezb_zcl_custom_cluster_cmd_req(&cmd);
+    esp_zigbee_lock_release();
 
-    PROD_LOG("SENSOR_HUB", "[CFG] fading_time=%lus → 0x%04hx ep%u",
+    PROD_LOG(TAG, "[CFG] fading_time=%lus -> 0x%04hx ep%u",
              (unsigned long)x->fs, x->sa, x->ep);
-
     free(x);
     vTaskDelete(NULL);
 }
-
-// ============================================================================
-// APPLY MODEL TO SENSOR — UNCHANGED
-// ============================================================================
 
 static bool apply_model_to_sensor(int idx, const char *model_id)
 {
@@ -614,8 +491,7 @@ static bool apply_model_to_sensor(int idx, const char *model_id)
         ESP_LOGW(TAG, "Sensor %d: unknown modelID '%s'", idx + 1, model_id);
         return false;
     }
-    strncpy(g_meta[idx].model_id, model_id,
-            sizeof(g_meta[idx].model_id) - 1);
+    strncpy(g_meta[idx].model_id, model_id, sizeof(g_meta[idx].model_id) - 1);
     g_meta[idx].model_id[sizeof(g_meta[idx].model_id) - 1] = '\0';
     g_meta[idx].model_known = true;
 
@@ -623,48 +499,38 @@ static bool apply_model_to_sensor(int idx, const char *model_id)
     if (c) {
         c->sensors[idx].sensor_type = (uint8_t)def->type;
         c->sensors[idx].sensor_role = (uint8_t)def->role;
-        PROD_LOG(TAG, "[ID] Sensor_%d | %-10s | IEEE=%s | Short=0x%04hx | Role=%s",
-                 idx + 1,
-                 friendly_name_from_type(def->type),
-                 c->sensors[idx].ieee_addr,
-                 c->sensors[idx].short_addr,
-                 role_str(def->role));
+        PROD_LOG(TAG, "[ID] Sensor_%d | %-10s | Short=0x%04hx | Role=%s",
+                 idx + 1, friendly_name_from_type(def->type),
+                 c->sensors[idx].short_addr, role_str(def->role));
         unlock_config();
     }
     mark_dirty();
     return true;
 }
 
-// ============================================================================
-// INFER AS DOOR SENSOR — UNCHANGED
-// ============================================================================
-
 static void infer_as_door_sensor(int idx)
 {
     hub_config_t *c = lock_config();
     if (!c) return;
-
     if ((sensor_type_t)c->sensors[idx].sensor_type != SENSOR_UNKNOWN) {
         unlock_config();
         return;
     }
-
     c->sensors[idx].sensor_type = (uint8_t)SENSOR_ZG_102Z;
     c->sensors[idx].sensor_role = (uint8_t)ROLE_DOOR;
-    strncpy(g_meta[idx].model_id, "ZG-102Z",
-            sizeof(g_meta[idx].model_id) - 1);
+    strncpy(g_meta[idx].model_id, "ZG-102Z", sizeof(g_meta[idx].model_id) - 1);
     g_meta[idx].model_known = true;
-
-    PROD_LOG(TAG, "[ID] Sensor_%d inferred as ZG-102Z (DOOR) — "
-             "model ID timed out (sleepy device)", idx + 1);
+    PROD_LOG(TAG, "[ID] Sensor_%d inferred ZG-102Z (sleepy door)", idx + 1);
     unlock_config();
     mark_dirty();
 }
 
-// ============================================================================
-// POST-IDENTIFICATION SETUP — UNCHANGED except fading guard (0 is now valid)
-// ============================================================================
-
+/* After identification: bind POWER_CONFIG, configure reporting, set fading.
+ *
+ * IAS Zone (0x0500) is intentionally NOT configured for attribute reporting.
+ * These sensors deliver presence/contact via Zone Status Change Notifications,
+ * which are handled directly. Forcing periodic IAS attribute reporting caused
+ * the ZG-204ZV to oscillate. */
 static void post_identification_setup(int idx, uint16_t short_addr, uint8_t ep)
 {
     if (idx < 0) return;
@@ -679,12 +545,9 @@ static void post_identification_setup(int idx, uint16_t short_addr, uint8_t ep)
 
     if (type == SENSOR_UNKNOWN) return;
 
-    /* ── Bind POWER_CONFIG ── */
     if (!g_meta[idx].power_config_bound) {
-        ezb_extaddr_t sensor_ieee;
-        ezb_extaddr_t coordinator_ieee;
+        ezb_extaddr_t sensor_ieee, coordinator_ieee;
         ezb_get_extended_address(&coordinator_ieee);
-
         if (ezb_address_extended_by_short(short_addr, &sensor_ieee)
                 == EZB_ERR_NONE) {
             ezb_zdo_bind_req_t req = {0};
@@ -695,15 +558,12 @@ static void post_identification_setup(int idx, uint16_t short_addr, uint8_t ep)
             req.field.dst_addr_mode          = EZB_ADDR_MODE_EXT;
             req.field.dst_addr.extended_addr = coordinator_ieee;
             req.field.dst_ep                 = COORDINATOR_ENDPOINT;
-            req.cb                           = NULL;
-            req.user_ctx                     = NULL;
             ezb_zdo_bind_req(&req);
             g_meta[idx].power_config_bound = true;
-            PROD_LOG(TAG, "[BIND] POWER_CONFIG → %s 0x%04hx", name, short_addr);
+            PROD_LOG(TAG, "[BIND] POWER_CONFIG -> %s 0x%04hx", name, short_addr);
         }
     }
 
-    /* ── Configure reporting ── */
     if (!g_meta[idx].reporting_configured) {
         ezb_zcl_config_report_cmd_t cmd = {0};
         cmd.cmd_ctrl.dst_addr.addr_mode    = EZB_ADDR_MODE_SHORT;
@@ -715,17 +575,6 @@ static void post_identification_setup(int idx, uint16_t short_addr, uint8_t ep)
         cmd.payload.record_number          = 1;
 
         if (type == SENSOR_ZG_204ZV) {
-            ezb_zcl_config_report_record_t ias = {
-                .direction = EZB_ZCL_REPORTING_SEND,
-                .attr_id   = ATTR_IAS_ZONE_STATUS,
-                .client    = {.attr_type = EZB_ZCL_ATTR_TYPE_UINT16,
-                              .min_interval = 2, .max_interval = 120,
-                              .reportable_change = {.u16 = 1}},
-            };
-            cmd.cmd_ctrl.cluster_id  = CLUSTER_IAS_ZONE;
-            cmd.payload.record_field = &ias;
-            (void)ezb_zcl_config_report_cmd_req(&cmd);
-
             ezb_zcl_config_report_record_t temp = {
                 .direction = EZB_ZCL_REPORTING_SEND,
                 .attr_id   = ATTR_TEMPERATURE_MEASURED,
@@ -748,16 +597,15 @@ static void post_identification_setup(int idx, uint16_t short_addr, uint8_t ep)
             cmd.payload.record_field = &hum;
             (void)ezb_zcl_config_report_cmd_req(&cmd);
 
-            /* min=0 forces immediate battery report on join */
-            ezb_zcl_config_report_record_t batt_z = {
+            ezb_zcl_config_report_record_t batt = {
                 .direction = EZB_ZCL_REPORTING_SEND,
                 .attr_id   = ATTR_BATTERY_PERCENT,
                 .client    = {.attr_type = EZB_ZCL_ATTR_TYPE_UINT8,
-                              .min_interval = 0, .max_interval = 300,
+                              .min_interval = 0, .max_interval = 3600,
                               .reportable_change = {.u8 = 2}},
             };
             cmd.cmd_ctrl.cluster_id  = CLUSTER_POWER_CONFIG;
-            cmd.payload.record_field = &batt_z;
+            cmd.payload.record_field = &batt;
             (void)ezb_zcl_config_report_cmd_req(&cmd);
 
         } else if (type == SENSOR_ZG_205Z_A) {
@@ -765,26 +613,15 @@ static void post_identification_setup(int idx, uint16_t short_addr, uint8_t ep)
                 .direction = EZB_ZCL_REPORTING_SEND,
                 .attr_id   = ATTR_OCCUPANCY,
                 .client    = {.attr_type = EZB_ZCL_ATTR_TYPE_UINT8,
-                              .min_interval = 2, .max_interval = 2,
+                              .min_interval = 2, .max_interval = 120,
                               .reportable_change = {.u8 = 1}},
             };
             cmd.cmd_ctrl.cluster_id  = CLUSTER_OCCUPANCY_SENSING;
             cmd.payload.record_field = &occ;
             (void)ezb_zcl_config_report_cmd_req(&cmd);
 
-            ezb_zcl_config_report_record_t batt_a = {
-                .direction = EZB_ZCL_REPORTING_SEND,
-                .attr_id   = ATTR_BATTERY_PERCENT,
-                .client    = {.attr_type = EZB_ZCL_ATTR_TYPE_UINT8,
-                              .min_interval = 60, .max_interval = 3600,
-                              .reportable_change = {.u8 = 2}},
-            };
-            cmd.cmd_ctrl.cluster_id  = CLUSTER_POWER_CONFIG;
-            cmd.payload.record_field = &batt_a;
-            (void)ezb_zcl_config_report_cmd_req(&cmd);
-
         } else if (type == SENSOR_ZG_102Z || type == SENSOR_ZG_102ZA) {
-            ezb_zcl_config_report_record_t batt_d = {
+            ezb_zcl_config_report_record_t batt = {
                 .direction = EZB_ZCL_REPORTING_SEND,
                 .attr_id   = ATTR_BATTERY_PERCENT,
                 .client    = {.attr_type = EZB_ZCL_ATTR_TYPE_UINT8,
@@ -792,7 +629,7 @@ static void post_identification_setup(int idx, uint16_t short_addr, uint8_t ep)
                               .reportable_change = {.u8 = 2}},
             };
             cmd.cmd_ctrl.cluster_id  = CLUSTER_POWER_CONFIG;
-            cmd.payload.record_field = &batt_d;
+            cmd.payload.record_field = &batt;
             (void)ezb_zcl_config_report_cmd_req(&cmd);
         }
 
@@ -801,21 +638,17 @@ static void post_identification_setup(int idx, uint16_t short_addr, uint8_t ep)
                  name, friendly_name_from_type(type));
     }
 
-    /* ── Fading time for presence sensors ── */
     if ((type == SENSOR_ZG_204ZV || type == SENSOR_ZG_205Z_A)
             && !g_meta[idx].fade_sent) {
         uart_hub_config_t cfg;
         uart_master_get_config(&cfg);
         uint32_t fade_sec = cfg.presence_fading_time_sec;
-        /* 0 is valid — means no hold time (sensor goes NO immediately) */
         if (fade_sec > 300) fade_sec = PRESENCE_FADING_TIME_DEFAULT_SEC;
 
         fade_args_t *fa = malloc(sizeof(fade_args_t));
         if (fa) {
-            fa->sa = short_addr;
-            fa->ep = ep;
-            fa->fs = fade_sec;
-            xTaskCreate(fade_task, "fade", 2048, fa, 3, NULL);
+            fa->sa = short_addr; fa->ep = ep; fa->fs = fade_sec;
+            xTaskCreate(fade_task, "fade", 3072, fa, 3, NULL);
         }
         g_meta[idx].fade_sent = true;
     }
@@ -824,14 +657,9 @@ static void post_identification_setup(int idx, uint16_t short_addr, uint8_t ep)
              name, friendly_name_from_type(type));
 }
 
-// ============================================================================
-// MODEL ID REQUEST — UNCHANGED
-// ============================================================================
-
 static void request_model_id(int idx, uint16_t short_addr, uint8_t ep)
 {
-    uint16_t attrs[] = {ATTR_BASIC_MANUFACTURER_NAME,
-                        ATTR_BASIC_MODEL_IDENTIFIER};
+    uint16_t attrs[] = {ATTR_BASIC_MODEL_IDENTIFIER};
     ezb_zcl_read_attr_cmd_t cmd = {
         .cmd_ctrl = {
             .dst_addr.addr_mode    = EZB_ADDR_MODE_SHORT,
@@ -841,20 +669,14 @@ static void request_model_id(int idx, uint16_t short_addr, uint8_t ep)
             .cluster_id            = CLUSTER_BASIC,
             .fc.direction          = EZB_ZCL_CMD_DIRECTION_TO_SRV,
         },
-        .payload.attr_number = 2,
+        .payload.attr_number = 1,
         .payload.attr_field  = attrs,
     };
     (void)ezb_zcl_read_attr_cmd_req(&cmd);
-
     g_meta[idx].model_id_pending = true;
     g_meta[idx].model_id_req_ms  = (uint32_t)(esp_timer_get_time() / 1000ULL);
-
-    PROD_LOG(TAG, "[ID] model ID read sent → 0x%04hx ep%u", short_addr, ep);
+    PROD_LOG(TAG, "[ID] model ID read -> 0x%04hx ep%u", short_addr, ep);
 }
-
-// ============================================================================
-// WATCHDOG PING — UNCHANGED
-// ============================================================================
 
 static void send_ping(uint16_t short_addr, uint8_t ep)
 {
@@ -876,85 +698,52 @@ static void send_ping(uint16_t short_addr, uint8_t ep)
     esp_zigbee_lock_release();
 }
 
-// ============================================================================
-// BIND CALLBACK — UNCHANGED
-// ============================================================================
-
 static void bind_result_callback(const ezb_zdp_bind_req_result_t *result,
-                                  void *user_ctx)
+                                 void *user_ctx)
 {
     uintptr_t ctx        = (uintptr_t)user_ctx;
     int       idx        = (int)((ctx >> 16) & 0xFFFF);
     uint16_t  short_addr = (uint16_t)(ctx & 0xFFFF);
-
     if (idx < 0 || idx >= MAX_SENSORS) return;
 
     bool ok = (result && result->error == EZB_ERR_NONE
                && result->rsp && result->rsp->status == 0x00);
+    if (ok) g_meta[idx].bind_confirmed++;
+    else    g_meta[idx].bind_failed++;
 
-    if (ok) {
-        g_meta[idx].bind_confirmed++;
-        PROD_LOG(TAG, "[BIND] ok → Sensor_%d 0x%04hx", idx + 1, short_addr);
-    } else {
-        g_meta[idx].bind_failed++;
-        PROD_LOG(TAG, "[BIND] fail → Sensor_%d 0x%04hx err=0x%04x",
-                 idx + 1, short_addr, result ? result->error : 0xFFFF);
-    }
-
-    uint8_t total_answered = g_meta[idx].bind_confirmed + g_meta[idx].bind_failed;
-    if (total_answered < g_meta[idx].bind_pending) return;
+    uint8_t answered = g_meta[idx].bind_confirmed + g_meta[idx].bind_failed;
+    if (answered < g_meta[idx].bind_pending) return;
 
     g_meta[idx].bound_once = true;
-
-    uint8_t ep = g_meta[idx].ep_active;
-    if (ep == 0) ep = 1;
+    uint8_t ep = g_meta[idx].ep_active ? g_meta[idx].ep_active : 1;
 
     if (g_meta[idx].bind_confirmed > 0 && !g_meta[idx].model_id_pending) {
         request_model_id(idx, short_addr, ep);
     } else if (g_meta[idx].bind_confirmed == 0) {
         g_meta[idx].model_id_pending = true;
         g_meta[idx].model_id_req_ms  = (uint32_t)(esp_timer_get_time() / 1000ULL);
-        PROD_LOG(TAG, "[ID] Sensor_%d all binds timed out — "
-                 "will infer as ZG-102Z after %dms",
-                 idx + 1, MODEL_ID_TIMEOUT_MS);
     }
 }
 
-// ============================================================================
-// ACTIVE EP CALLBACK — UNCHANGED
-// ============================================================================
-
-static void active_ep_callback(
-        const ezb_zdo_active_ep_req_result_t *result, void *user_ctx)
+static void active_ep_callback(const ezb_zdo_active_ep_req_result_t *result,
+                               void *user_ctx)
 {
     uint16_t short_addr = (uint16_t)(uintptr_t)user_ctx;
     if (!result || result->error != EZB_ERR_NONE || !result->rsp) {
-        ESP_LOGW(TAG, "[EP] query failed for 0x%04hx err=%d",
-                 short_addr, result ? result->error : -1);
+        ESP_LOGW(TAG, "[EP] query failed 0x%04hx", short_addr);
         return;
     }
-
     int idx = find_sensor_index_by_short(short_addr);
-    if (idx < 0) return;
-
-    if (result->rsp->active_ep_count == 0) {
-        ESP_LOGW(TAG, "[EP] 0 endpoints for 0x%04hx", short_addr);
-        return;
-    }
+    if (idx < 0 || result->rsp->active_ep_count == 0) return;
 
     uint8_t ep = result->rsp->active_ep_list[0];
     g_meta[idx].ep_active = ep;
+    PROD_LOG(TAG, "[EP] 0x%04hx ep=%u — binding %zu clusters",
+             short_addr, ep, INITIAL_BIND_COUNT);
 
-    PROD_LOG(TAG, "[EP] 0x%04hx has %u endpoint(s) — binding %zu clusters",
-             short_addr, result->rsp->active_ep_count, INITIAL_BIND_COUNT);
-
-    ezb_extaddr_t sensor_ieee;
-    if (ezb_address_extended_by_short(short_addr, &sensor_ieee) != EZB_ERR_NONE) {
-        ESP_LOGW(TAG, "[EP] IEEE resolve failed for 0x%04hx", short_addr);
+    ezb_extaddr_t sensor_ieee, coordinator_ieee;
+    if (ezb_address_extended_by_short(short_addr, &sensor_ieee) != EZB_ERR_NONE)
         return;
-    }
-
-    ezb_extaddr_t coordinator_ieee;
     ezb_get_extended_address(&coordinator_ieee);
 
     g_meta[idx].bind_pending   = (uint8_t)INITIAL_BIND_COUNT;
@@ -977,53 +766,52 @@ static void active_ep_callback(
     }
 }
 
-// ============================================================================
-// MODEL ID TIMEOUT TASK — UNCHANGED
-// ============================================================================
-
 static void model_id_timeout_task(void *arg)
 {
     (void)arg;
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(1000));
-
         uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000ULL);
 
         hub_config_t *c = lock_config();
-        if (!c) continue;
-        int count = c->sensor_count;
-        unlock_config();
+        int count = c ? c->sensor_count : 0;
+        if (c) unlock_config();
 
         for (int i = 0; i < count; i++) {
             if (!g_meta[i].model_id_pending) continue;
-
-            uint32_t elapsed = now_ms - g_meta[i].model_id_req_ms;
-            if (elapsed < MODEL_ID_TIMEOUT_MS) continue;
+            if ((now_ms - g_meta[i].model_id_req_ms) < MODEL_ID_TIMEOUT_MS)
+                continue;
 
             g_meta[i].model_id_pending = false;
 
             hub_config_t *c2 = lock_config();
             if (!c2) continue;
-            uint16_t short_addr = c2->sensors[i].short_addr;
-            uint8_t  ep         = g_meta[i].ep_active;
-            if (ep == 0) ep = 1;
+            uint16_t sa = c2->sensors[i].short_addr;
+            uint8_t  ep = g_meta[i].ep_active ? g_meta[i].ep_active : 1;
             sensor_type_t tp = (sensor_type_t)c2->sensors[i].sensor_type;
             unlock_config();
 
             if (tp == SENSOR_UNKNOWN) {
-                PROD_LOG(TAG,
-                         "[ID] Sensor_%d model ID timed out — "
-                         "inferring ZG-102Z (sleepy device)", i + 1);
                 infer_as_door_sensor(i);
-                post_identification_setup(i, short_addr, ep);
+                post_identification_setup(i, sa, ep);
             }
         }
     }
 }
 
-// ============================================================================
-// ZCL READ ATTR RESPONSE — UNCHANGED
-// ============================================================================
+static void mark_online_locked(hub_config_t *c, int idx)
+{
+    bool was_offline = !c->sensors[idx].online;
+    c->sensors[idx].online    = true;
+    c->sensors[idx].last_seen = (time_t)(esp_timer_get_time() / 1000000ULL);
+    g_meta[idx].ping_pending  = false;
+    g_meta[idx].miss_count    = 0;
+    if (was_offline) {
+        PROD_LOG(TAG, "[WDG] %s back ONLINE", c->sensors[idx].sensor_name);
+        uart_master_send_sensor_health(c->sensors[idx].sensor_name, true);
+        update_hub_aggregate_locked(c);
+    }
+}
 
 static void zcl_core_read_attr_rsp_handler(
         ezb_zcl_cmd_read_attr_rsp_message_t *message)
@@ -1036,30 +824,13 @@ static void zcl_core_read_attr_rsp_handler(
     int idx = find_sensor_index_by_short(short_addr);
     if (idx < 0) return;
 
-    {
-        hub_config_t *c = lock_config();
-        if (c) {
-            bool was_offline = !c->sensors[idx].online;
-            c->sensors[idx].online    = true;
-            c->sensors[idx].last_seen = (time_t)(esp_timer_get_time() / 1000000ULL);
-            g_meta[idx].ping_pending  = false;
-            g_meta[idx].miss_count    = 0;
-            if (was_offline) {
-                PROD_LOG(TAG, "[WDG] %s back ONLINE",
-                         c->sensors[idx].sensor_name);
-                uart_master_send_sensor_health(
-                    c->sensors[idx].sensor_name, true);
-                update_hub_aggregate_locked(c);
-            }
-            unlock_config();
-        }
-    }
+    hub_config_t *c = lock_config();
+    if (c) { mark_online_locked(c, idx); unlock_config(); }
 
     if (!g_meta[idx].model_id_pending) return;
-
     g_meta[idx].model_id_pending = false;
 
-    bool model_applied = false;
+    bool applied = false;
     ezb_zcl_read_attr_rsp_variable_t *var = message->in.variables;
     while (var) {
         if (var->status == EZB_ZCL_STATUS_SUCCESS &&
@@ -1069,22 +840,17 @@ static void zcl_core_read_attr_rsp_handler(
             if (len >= sizeof(model)) len = (uint8_t)(sizeof(model) - 1);
             memcpy(model, (char *)(var->attr_value + 1), len);
             model[len] = '\0';
-            model_applied = apply_model_to_sensor(idx, model);
+            applied = apply_model_to_sensor(idx, model);
         }
         var = var->next;
     }
 
-    if (model_applied) {
-        uint8_t ep = g_meta[idx].ep_active;
-        if (ep == 0) ep = src_ep;
-        if (ep == 0) ep = 1;
+    if (applied) {
+        uint8_t ep = g_meta[idx].ep_active ? g_meta[idx].ep_active
+                                           : (src_ep ? src_ep : 1);
         post_identification_setup(idx, short_addr, ep);
     }
 }
-
-// ============================================================================
-// IAS ZONE ENROLL HANDLER — UNCHANGED
-// ============================================================================
 
 static void zcl_ias_zone_enroll_handler(
         ezb_zcl_ias_zone_enroll_req_message_t *message)
@@ -1105,10 +871,8 @@ static void zcl_ias_zone_enroll_handler(
     rsp.payload.enroll_rsp_code        =
         EZB_ZCL_IAS_ZONE_ENROLL_RESPONSE_CODE_SUCCESS;
     rsp.payload.zone_id                = zone_id;
-
-    ezb_err_t ret = ezb_zcl_ias_zone_enroll_cmd_resp(&rsp);
-    PROD_LOG(TAG, "[IAS] EnrollRsp → 0x%04hx zone_id=%u ret=0x%04x",
-             short_addr, zone_id, ret);
+    (void)ezb_zcl_ias_zone_enroll_cmd_resp(&rsp);
+    PROD_LOG(TAG, "[IAS] EnrollRsp -> 0x%04hx zone_id=%u", short_addr, zone_id);
 
     if (idx >= 0) {
         hub_config_t *c = lock_config();
@@ -1123,18 +887,8 @@ static void zcl_ias_zone_enroll_handler(
     }
 }
 
-// ============================================================================
-// IAS ZONE STATUS CHANGE HANDLER
-//
-// KEY CHANGE from previous version:
-//   - No evaluate_unit_occupancy_locked() — Master owns unit occupancy
-//   - No door_closed_pending logic
-//   - Door events: report to Master via uart_master_send_door()
-//     and record door_opened_at timestamp on OPEN for Master to use
-//   - Presence events: update hub aggregate, send sensor_presence to Master
-//   - Hub aggregate change → uart_master_send_hub_aggregate()
-// ============================================================================
-
+/* IAS Zone status change — presence (mmWave) and contact (door).
+ * This is the authoritative state channel. */
 static void zcl_ias_zone_status_change_handler(
         ezb_zcl_ias_zone_status_change_notif_message_t *message)
 {
@@ -1149,120 +903,69 @@ static void zcl_ias_zone_status_change_handler(
 
     int idx = find_sensor_index_by_short(short_addr);
     if (idx < 0) {
-        ESP_LOGW(TAG, "IAS from unknown 0x%04hx zone=0x%04hx",
-                 short_addr, zone_status);
+        ESP_LOGW(TAG, "IAS from unknown 0x%04hx", short_addr);
         return;
     }
 
     hub_config_t *c = lock_config();
     if (!c) return;
 
-    bool was_offline = !c->sensors[idx].online;
-    c->sensors[idx].online    = true;
-    c->sensors[idx].last_seen = (time_t)(esp_timer_get_time() / 1000000ULL);
-    g_meta[idx].ping_pending  = false;
-    g_meta[idx].miss_count    = 0;
-
-    if (was_offline) {
-        PROD_LOG(TAG, "[WDG] %s back ONLINE", c->sensors[idx].sensor_name);
-        uart_master_send_sensor_health(c->sensors[idx].sensor_name, true);
-    }
+    mark_online_locked(c, idx);
 
     sensor_type_t t    = (sensor_type_t)c->sensors[idx].sensor_type;
     sensor_role_t role = (sensor_role_t)c->sensors[idx].sensor_role;
     sensor_t     *s    = &c->sensors[idx];
-
     s->tamper      = tamper;
     s->battery_low = batt_low;
 
-    /* ZG-102Z fallback identification — UNCHANGED */
     if (t == SENSOR_UNKNOWN) {
-        uint8_t ep = g_meta[idx].ep_active;
-        if (ep == 0) ep = src_ep;
-        if (ep == 0) ep = 1;
-
+        uint8_t ep = g_meta[idx].ep_active ? g_meta[idx].ep_active
+                                           : (src_ep ? src_ep : 1);
         s->contact_open = alarm1;
         unlock_config();
-
-        if (!g_meta[idx].model_id_pending) {
-            PROD_LOG(TAG, "[ID] Sensor_%d: IAS from unidentified sensor — "
-                     "retrying model ID read (sensor is awake)",
-                     idx + 1);
+        if (!g_meta[idx].model_id_pending)
             request_model_id(idx, short_addr, ep);
-        }
         return;
     }
 
-    /* DOOR SENSOR — report to Master, record timestamps */
     if (role == ROLE_DOOR) {
-        bool state_changed = (s->contact_open != alarm1);
-        s->contact_open    = alarm1;
-
-        if (state_changed) {
-            s->last_change = (time_t)(esp_timer_get_time() / 1000000ULL);
-
-            if (alarm1) {
-                /* Door OPEN — record timestamp so Master can calculate duration */
-                s->door_opened_at = s->last_change;
-            } else {
-                /* Door CLOSED — clear opened_at */
-                s->door_opened_at = 0;
-            }
-
-            PROD_LOG(TAG, "[DATA] %s [%s] contact=%s",
-                     s->sensor_name, friendly_name_from_type(t),
-                     alarm1 ? "OPEN" : "CLOSED");
-
-            /*
-             * Send door event to Master.
-             * Master uses door open/close + presence state to calculate
-             * unit occupancy. Hub reports the raw event with UTC timestamp.
-             */
-            uart_master_send_door(s->sensor_name, alarm1);
-            uart_master_notify_door_state(idx, s->sensor_name, alarm1);
+        bool changed = (s->contact_open != alarm1);
+        s->contact_open = alarm1;
+        if (changed) {
+            s->last_change    = (time_t)(esp_timer_get_time() / 1000000ULL);
+            s->door_opened_at = alarm1 ? s->last_change : 0;
+            PROD_LOG(TAG, "[DATA] %s contact=%s",
+                     s->sensor_name, alarm1 ? "OPEN" : "CLOSED");
+            char name[SENSOR_NAME_LEN];
+            strncpy(name, s->sensor_name, SENSOR_NAME_LEN - 1);
+            name[SENSOR_NAME_LEN - 1] = '\0';
+            unlock_config();
+            uart_master_send_door(name, alarm1);
+            uart_master_notify_door_state(idx, name, alarm1);
+            mark_dirty();
+            return;
         }
-
-    /* PRESENCE SENSOR — update hub aggregate, report to Master */
-    } else if (role == ROLE_PRESENCE ||
-               t    == SENSOR_ZG_204ZV  ||
-               t    == SENSOR_ZG_205Z_A) {
-
-        bool state_changed = (s->presence != alarm1);
+    } else if (role == ROLE_PRESENCE) {
+        bool changed = (s->presence != alarm1);
         s->presence = alarm1;
-
-        if (state_changed) {
+        if (changed) {
             s->last_change = (time_t)(esp_timer_get_time() / 1000000ULL);
-            PROD_LOG(TAG, "[DATA] %s [%s] presence=%s",
-                     s->sensor_name, friendly_name_from_type(t),
-                     alarm1 ? "YES" : "NO");
-
-            /* Send individual presence event to Master */
-            uart_master_send_sensor_presence(s->sensor_name,
-                                              friendly_name_from_type(t),
-                                              alarm1);
-
-            /*
-             * Update hub aggregate.
-             * If aggregate changes, uart_master_send_hub_aggregate() is called
-             * inside update_hub_aggregate_locked().
-             */
+            PROD_LOG(TAG, "[DATA] %s presence=%s",
+                     s->sensor_name, alarm1 ? "YES" : "NO");
+            char name[SENSOR_NAME_LEN];
+            strncpy(name, s->sensor_name, SENSOR_NAME_LEN - 1);
+            name[SENSOR_NAME_LEN - 1] = '\0';
+            const char *model = friendly_name_from_type(t);
+            uart_master_send_sensor_presence(name, model, alarm1);
             update_hub_aggregate_locked(c);
         }
-
-    } else {
-        s->presence = alarm1;
-        PROD_LOG(TAG, "[DATA] Sensor_%d unclassified IAS alarm1=%d",
-                 idx + 1, alarm1);
     }
 
     unlock_config();
     mark_dirty();
 }
 
-// ============================================================================
-// REPORT ATTRIBUTE HANDLER
-// ============================================================================
-
+/* Attribute reports — environment, battery, occupancy (ZG-205Z/A). */
 static void zcl_core_cmd_report_attr_handler(
         ezb_zcl_cmd_report_attr_message_t *message)
 {
@@ -1279,43 +982,24 @@ static void zcl_core_cmd_report_attr_handler(
 
     hub_config_t *c = lock_config();
     if (!c) return;
+    mark_online_locked(c, idx);
 
-    bool was_offline = !c->sensors[idx].online;
-    c->sensors[idx].online    = true;
-    c->sensors[idx].last_seen = (time_t)(esp_timer_get_time() / 1000000ULL);
-    g_meta[idx].ping_pending  = false;
-    g_meta[idx].miss_count    = 0;
-    if (was_offline) {
-        PROD_LOG(TAG, "[WDG] %s back ONLINE", c->sensors[idx].sensor_name);
-        uart_master_send_sensor_health(c->sensors[idx].sensor_name, true);
-        update_hub_aggregate_locked(c);
-    }
+    sensor_t     *s  = &c->sensors[idx];
+    sensor_type_t tp = (sensor_type_t)s->sensor_type;
+    bool changed = false;
 
-    sensor_t     *s       = &c->sensors[idx];
-    sensor_type_t tp      = (sensor_type_t)s->sensor_type;
-    bool          changed = false;
-
-    /* Secondary identification from cluster — UNCHANGED */
     if (tp == SENSOR_UNKNOWN) {
-        uint8_t ep = g_meta[idx].ep_active;
-        if (ep == 0) ep = src_ep;
-        if (ep == 0) ep = 1;
-
-        const char *inferred_model = NULL;
+        uint8_t ep = g_meta[idx].ep_active ? g_meta[idx].ep_active
+                                           : (src_ep ? src_ep : 1);
+        const char *inferred = NULL;
         if (cluster_id == CLUSTER_TEMP_MEASUREMENT ||
-            cluster_id == CLUSTER_HUMIDITY) {
-            inferred_model = "ZG-204ZV";
-        } else if (cluster_id == CLUSTER_OCCUPANCY_SENSING) {
-            inferred_model = "CK-BL702-MWS-01(7016)";
-        }
-
-        if (inferred_model) {
-            PROD_LOG(TAG, "[ID] Sensor_%d: cluster 0x%04hx → infer %s",
-                     idx + 1, cluster_id, inferred_model);
+            cluster_id == CLUSTER_HUMIDITY)          inferred = "ZG-204ZV";
+        else if (cluster_id == CLUSTER_OCCUPANCY_SENSING)
+                                                     inferred = "CK-BL702-MWS-01(7016)";
+        if (inferred) {
             unlock_config();
-            if (apply_model_to_sensor(idx, inferred_model)) {
+            if (apply_model_to_sensor(idx, inferred))
                 post_identification_setup(idx, short_addr, ep);
-            }
             c = lock_config();
             if (!c) return;
             s  = &c->sensors[idx];
@@ -1327,111 +1011,70 @@ static void zcl_core_cmd_report_attr_handler(
     }
 
     if (tp == SENSOR_ZG_204ZV) {
-        if (cluster_id == CLUSTER_TEMP_MEASUREMENT) {
-            for (ezb_zcl_report_attr_variable_t *v = message->in.variables;
-                     v; v = v->next) {
-                if (v->attr_id == ATTR_TEMPERATURE_MEASURED) {
-                    s->temperature_cdeg = *(int16_t *)v->attr_value;
-                    changed = true;
-                    PROD_LOG(TAG, "[DATA] %s temp=%.2f°C", s->sensor_name,
-                             (double)s->temperature_cdeg / 100.0);
-                    uart_master_send_environment(
-                        s->sensor_name,
-                        (float)s->temperature_cdeg / 100.0f,
-                        (float)s->humidity_cpct    / 100.0f);
-                }
-            }
-        } else if (cluster_id == CLUSTER_HUMIDITY) {
-            for (ezb_zcl_report_attr_variable_t *v = message->in.variables;
-                     v; v = v->next) {
-                if (v->attr_id == ATTR_HUMIDITY_MEASURED) {
-                    s->humidity_cpct = *(uint16_t *)v->attr_value;
-                    changed = true;
-                    PROD_LOG(TAG, "[DATA] %s hum=%.2f%%", s->sensor_name,
-                             (double)s->humidity_cpct / 100.0);
-                    uart_master_send_environment(
-                        s->sensor_name,
-                        (float)s->temperature_cdeg / 100.0f,
-                        (float)s->humidity_cpct    / 100.0f);
-                }
-            }
-        } else if (cluster_id == CLUSTER_POWER_CONFIG) {
-            for (ezb_zcl_report_attr_variable_t *v = message->in.variables;
-                     v; v = v->next) {
-                if (v->attr_id == ATTR_BATTERY_PERCENT) {
-                    uint8_t raw = *(uint8_t *)v->attr_value;
-                    uint8_t pct = raw / 2;
-                    if (pct > 100) pct = 100;
-                    s->battery_pct = pct;
-                    changed = true;
-                    PROD_LOG(TAG, "[DATA] %s battery=%u%%",
-                             s->sensor_name, s->battery_pct);
-                    uart_master_send_battery(s->sensor_name, s->battery_pct);
-                }
+        for (ezb_zcl_report_attr_variable_t *v = message->in.variables;
+                 v; v = v->next) {
+            if (cluster_id == CLUSTER_TEMP_MEASUREMENT &&
+                    v->attr_id == ATTR_TEMPERATURE_MEASURED) {
+                s->temperature_cdeg = *(int16_t *)v->attr_value;
+                changed = true;
+                uart_master_send_environment(s->sensor_name,
+                    (float)s->temperature_cdeg / 100.0f,
+                    (float)s->humidity_cpct    / 100.0f);
+            } else if (cluster_id == CLUSTER_HUMIDITY &&
+                    v->attr_id == ATTR_HUMIDITY_MEASURED) {
+                s->humidity_cpct = *(uint16_t *)v->attr_value;
+                changed = true;
+                uart_master_send_environment(s->sensor_name,
+                    (float)s->temperature_cdeg / 100.0f,
+                    (float)s->humidity_cpct    / 100.0f);
+            } else if (cluster_id == CLUSTER_POWER_CONFIG &&
+                    v->attr_id == ATTR_BATTERY_PERCENT) {
+                uint8_t pct = *(uint8_t *)v->attr_value / 2;
+                if (pct > 100) pct = 100;
+                s->battery_pct = pct;
+                changed = true;
+                uart_master_send_battery(s->sensor_name, pct);
             }
         }
     } else if (tp == SENSOR_ZG_205Z_A) {
-        if (cluster_id == CLUSTER_OCCUPANCY_SENSING) {
-            for (ezb_zcl_report_attr_variable_t *v = message->in.variables;
-                     v; v = v->next) {
-                if (v->attr_id == ATTR_OCCUPANCY) {
-                    bool occ        = (*(uint8_t *)v->attr_value) != 0;
-                    bool state_chgd = (s->presence != occ);
-                    s->presence = occ;
-                    changed     = true;
-                    if (state_chgd) {
-                        s->last_change = (time_t)(esp_timer_get_time() / 1000000ULL);
-                        PROD_LOG(TAG, "[DATA] %s [ZG-205Z/A] presence=%s",
-                                 s->sensor_name, occ ? "YES" : "NO");
-                        uart_master_send_sensor_presence(
-                            s->sensor_name,
-                            friendly_name_from_type(tp), occ);
-                        update_hub_aggregate_locked(c);
-                    }
-                }
-            }
-        } else if (cluster_id == CLUSTER_POWER_CONFIG) {
-            for (ezb_zcl_report_attr_variable_t *v = message->in.variables;
-                     v; v = v->next) {
-                if (v->attr_id == ATTR_BATTERY_PERCENT) {
-                    uint8_t raw = *(uint8_t *)v->attr_value;
-                    uint8_t pct = raw / 2;
-                    if (pct > 100) pct = 100;
-                    s->battery_pct = pct;
+        for (ezb_zcl_report_attr_variable_t *v = message->in.variables;
+                 v; v = v->next) {
+            if (cluster_id == CLUSTER_OCCUPANCY_SENSING &&
+                    v->attr_id == ATTR_OCCUPANCY) {
+                bool occ = (*(uint8_t *)v->attr_value) != 0;
+                if (s->presence != occ) {
+                    s->presence    = occ;
+                    s->last_change = (time_t)(esp_timer_get_time() / 1000000ULL);
                     changed = true;
-                    PROD_LOG(TAG, "[DATA] %s battery=%u%%",
-                             s->sensor_name, s->battery_pct);
-                    uart_master_send_battery(s->sensor_name, s->battery_pct);
+                    uart_master_send_sensor_presence(s->sensor_name,
+                        friendly_name_from_type(tp), occ);
+                    update_hub_aggregate_locked(c);
                 }
+            } else if (cluster_id == CLUSTER_POWER_CONFIG &&
+                    v->attr_id == ATTR_BATTERY_PERCENT) {
+                uint8_t pct = *(uint8_t *)v->attr_value / 2;
+                if (pct > 100) pct = 100;
+                s->battery_pct = pct;
+                changed = true;
+                uart_master_send_battery(s->sensor_name, pct);
             }
         }
     } else if (tp == SENSOR_ZG_102Z || tp == SENSOR_ZG_102ZA) {
-        if (cluster_id == CLUSTER_POWER_CONFIG) {
-            for (ezb_zcl_report_attr_variable_t *v = message->in.variables;
-                     v; v = v->next) {
-                if (v->attr_id == ATTR_BATTERY_PERCENT) {
-                    uint8_t raw = *(uint8_t *)v->attr_value;
-                    uint8_t pct = raw / 2;
-                    if (pct > 100) pct = 100;
-                    s->battery_pct = pct;
-                    changed = true;
-                    PROD_LOG(TAG, "[DATA] %s battery=%u%%",
-                             s->sensor_name, s->battery_pct);
-                    uart_master_send_battery(s->sensor_name, s->battery_pct);
-                }
+        for (ezb_zcl_report_attr_variable_t *v = message->in.variables;
+                 v; v = v->next) {
+            if (cluster_id == CLUSTER_POWER_CONFIG &&
+                    v->attr_id == ATTR_BATTERY_PERCENT) {
+                uint8_t pct = *(uint8_t *)v->attr_value / 2;
+                if (pct > 100) pct = 100;
+                s->battery_pct = pct;
+                changed = true;
+                uart_master_send_battery(s->sensor_name, pct);
             }
         }
     }
 
     unlock_config();
     if (changed) mark_dirty();
-}
-
-static void zcl_core_cmd_default_rsp_handler(
-        ezb_zcl_cmd_default_rsp_message_t *message)
-{
-    if (!message) return;
-    DEV_LOG(TAG, "ZCL DefaultRsp status=0x%02x", message->in.status_code);
 }
 
 static void esp_zigbee_zcl_core_action_handler(
@@ -1446,10 +1089,6 @@ static void esp_zigbee_zcl_core_action_handler(
         zcl_core_cmd_report_attr_handler(
             (ezb_zcl_cmd_report_attr_message_t *)message);
         break;
-    case EZB_ZCL_CORE_DEFAULT_RSP_CB_ID:
-        zcl_core_cmd_default_rsp_handler(
-            (ezb_zcl_cmd_default_rsp_message_t *)message);
-        break;
     case EZB_ZCL_CORE_IAS_ZONE_ENROLL_CB_ID:
         zcl_ias_zone_enroll_handler(
             (ezb_zcl_ias_zone_enroll_req_message_t *)message);
@@ -1459,62 +1098,34 @@ static void esp_zigbee_zcl_core_action_handler(
             (ezb_zcl_ias_zone_status_change_notif_message_t *)message);
         break;
     default:
-        RAW_LOG("[RAW] ZCL 0x%04lx (unhandled)\n",
-                (unsigned long)callback_id);
         break;
     }
 }
-
-static bool raw_frame_handler(const ezb_zcl_raw_frame_t *raw_frame)
-{
-    if (!raw_frame || !raw_frame->header) return false;
-    uint16_t cluster_id = raw_frame->header->cluster_id;
-    if (cluster_id == CLUSTER_PRIVATE_TUYA && raw_frame->payload_length > 0) {
-        RAW_LOG("[RAW] EF00 src=0x%04hx:",
-                raw_frame->header->src_addr.u.short_addr);
-        for (uint16_t i = 0; i < raw_frame->payload_length; i++)
-            RAW_LOG(" %02X", raw_frame->payload[i]);
-        RAW_LOG("\n");
-    }
-    return false;
-}
-
-// ============================================================================
-// WATCHDOG TASK — UNCHANGED except update_hub_aggregate_locked calls
-// ============================================================================
 
 #if WATCHDOG_ENABLE
 static void sensor_watchdog_task(void *arg)
 {
     (void)arg;
-
     uart_hub_config_t cfg;
     uart_master_get_config(&cfg);
 
-    while (!g_watchdog_started) {
-        vTaskDelay(pdMS_TO_TICKS(1000));
-    }
-    PROD_LOG(TAG, "[WDG] Watchdog started — %umin cycle, %us ping timeout",
+    while (!g_watchdog_started) vTaskDelay(pdMS_TO_TICKS(1000));
+    PROD_LOG(TAG, "[WDG] started — %umin cycle, %us timeout",
              cfg.watchdog_interval_min, cfg.watchdog_ping_timeout_sec);
-
-    vTaskDelay(pdMS_TO_TICKS(
-        (uint32_t)cfg.watchdog_interval_min * 60UL * 1000UL));
+    vTaskDelay(pdMS_TO_TICKS((uint32_t)cfg.watchdog_interval_min * 60000UL));
 
     for (;;) {
         uart_master_get_config(&cfg);
-        uint32_t interval_ms = (uint32_t)cfg.watchdog_interval_min * 60UL * 1000UL;
+        uint32_t interval_ms = (uint32_t)cfg.watchdog_interval_min * 60000UL;
         uint32_t ping_ms     = (uint32_t)cfg.watchdog_ping_timeout_sec * 1000UL;
 
         hub_config_t *cc = lock_config();
         int count = cc ? cc->sensor_count : 0;
         if (cc) unlock_config();
 
-        PROD_LOG(TAG, "[WDG] Health check (%d sensors)", count);
-
         for (int i = 0; i < count; i++) {
             hub_config_t *c = lock_config();
             if (!c) continue;
-
             bool          online     = c->sensors[i].online;
             uint16_t      short_addr = c->sensors[i].short_addr;
             uint8_t       ep         = c->sensors[i].endpoint;
@@ -1525,15 +1136,14 @@ static void sensor_watchdog_task(void *arg)
             name[SENSOR_NAME_LEN - 1] = '\0';
             unlock_config();
 
-            /* DOOR sensors — NEVER mark offline */
+            /* Door sensors are sleepy — never pinged, never marked offline. */
             if (role == ROLE_DOOR) {
                 if (last_seen > 0 && cfg.door_sensor_max_silence_hours > 0) {
-                    time_t now_up    = (time_t)(esp_timer_get_time() / 1000000ULL);
-                    time_t silence   = now_up - last_seen;
-                    time_t threshold = (time_t)cfg.door_sensor_max_silence_hours * 3600;
-                    if (silence > threshold) {
-                        PROD_LOG(TAG,
-                                 "[WDG] %s door silent %ldh — alert",
+                    time_t now_up  = (time_t)(esp_timer_get_time() / 1000000ULL);
+                    time_t silence = now_up - last_seen;
+                    time_t thresh  = (time_t)cfg.door_sensor_max_silence_hours * 3600;
+                    if (silence > thresh) {
+                        PROD_LOG(TAG, "[WDG] %s silent %ldh — alert",
                                  name, (long)(silence / 3600));
                         uart_master_send_sensor_health(name, false);
                         hub_config_t *cu = lock_config();
@@ -1548,12 +1158,9 @@ static void sensor_watchdog_task(void *arg)
                 continue;
             }
 
-            /* PRESENCE sensors — ping */
             if (!online) {
                 g_meta[i].miss_count++;
                 if (g_meta[i].miss_count >= WATCHDOG_OFFLINE_PAIRING_THRESHOLD) {
-                    PROD_LOG(TAG, "[WDG] %s offline %u cycles — opening pairing",
-                             name, g_meta[i].miss_count);
                     g_meta[i].miss_count = 0;
                     uart_cmd_start_pairing(WATCHDOG_PAIRING_REOPEN_SEC);
                 }
@@ -1564,7 +1171,6 @@ static void sensor_watchdog_task(void *arg)
             g_meta[i].ping_pending = true;
             send_ping(short_addr, ep);
             vTaskDelay(pdMS_TO_TICKS(ping_ms));
-
             if (g_meta[i].ping_pending) {
                 send_ping(short_addr, ep);
                 vTaskDelay(pdMS_TO_TICKS(ping_ms));
@@ -1582,27 +1188,17 @@ static void sensor_watchdog_task(void *arg)
                 uart_master_send_sensor_health(name, false);
                 g_meta[i].ping_pending = false;
                 g_meta[i].miss_count   = 1;
-            } else {
-                PROD_LOG(TAG, "[WDG] %s ONLINE", name);
-                g_meta[i].miss_count = 0;
             }
-
             vTaskDelay(pdMS_TO_TICKS(500));
         }
-
         vTaskDelay(pdMS_TO_TICKS(interval_ms));
     }
 }
 #endif
 
-// ============================================================================
-// REJOIN TASK — UNCHANGED (static arrays, 6144 stack)
-// ============================================================================
-
 static void rejoin_task(void *arg)
 {
     (void)arg;
-
     vTaskDelay(pdMS_TO_TICKS(2000));
 
     hub_config_t *c = lock_config();
@@ -1624,8 +1220,8 @@ static void rejoin_task(void *arg)
     static uint8_t       role_list[MAX_SENSORS];
 
     for (int i = 0; i < count; i++) {
-        strncpy(ieee_list[i],  c->sensors[i].ieee_addr,   IEEE_ADDR_STR_LEN - 1);
-        strncpy(name_list[i],  c->sensors[i].sensor_name, SENSOR_NAME_LEN   - 1);
+        strncpy(ieee_list[i], c->sensors[i].ieee_addr,   IEEE_ADDR_STR_LEN - 1);
+        strncpy(name_list[i], c->sensors[i].sensor_name, SENSOR_NAME_LEN   - 1);
         ieee_list[i][IEEE_ADDR_STR_LEN - 1] = '\0';
         name_list[i][SENSOR_NAME_LEN   - 1] = '\0';
         short_list[i] = c->sensors[i].short_addr;
@@ -1646,12 +1242,10 @@ static void rejoin_task(void *arg)
         }
 
         ezb_extaddr_t target_ieee = {0};
-        unsigned int  bytes[8]    = {0};
-        int parsed = sscanf(ieee_list[i],
-                            "%02X:%02X:%02X:%02X:%02X:%02X:%02X:%02X",
-                            &bytes[7], &bytes[6], &bytes[5], &bytes[4],
-                            &bytes[3], &bytes[2], &bytes[1], &bytes[0]);
-        if (parsed != 8) {
+        unsigned int  bytes[8] = {0};
+        if (sscanf(ieee_list[i], "%02X:%02X:%02X:%02X:%02X:%02X:%02X:%02X",
+                   &bytes[7], &bytes[6], &bytes[5], &bytes[4],
+                   &bytes[3], &bytes[2], &bytes[1], &bytes[0]) != 8) {
             total_offline++;
             uart_master_send_sensor_status(i, name_list[i],
                 friendly_name_from_type(type_list[i]),
@@ -1663,7 +1257,7 @@ static void rejoin_task(void *arg)
 
         bool is_sleepy = (type_list[i] == SENSOR_ZG_102Z ||
                           type_list[i] == SENSOR_ZG_102ZA);
-        bool joined    = false;
+        bool joined = false;
 
         for (int attempt = 1; attempt <= REJOIN_RETRY_COUNT; attempt++) {
             if (is_sleepy) {
@@ -1679,10 +1273,10 @@ static void rejoin_task(void *arg)
                 }
             } else {
                 ezb_zdo_nwk_addr_req_t req = {0};
-                req.dst_nwk_addr                  = 0xFFFF;
-                req.field.ieee_addr_of_interest    = target_ieee;
-                req.field.request_type             = 0;
-                req.field.start_index              = 0;
+                req.dst_nwk_addr                = 0xFFFF;
+                req.field.ieee_addr_of_interest = target_ieee;
+                req.field.request_type          = 0;
+                req.field.start_index           = 0;
                 esp_zigbee_lock_acquire(portMAX_DELAY);
                 (void)ezb_zdo_nwk_addr_req(&req);
                 esp_zigbee_lock_release();
@@ -1724,18 +1318,13 @@ static void rejoin_task(void *arg)
     vTaskDelete(NULL);
 }
 
-// ============================================================================
-// ZIGBEE APP SIGNAL HANDLER — UNCHANGED
-// ============================================================================
-
 static void deferred_formation_task(void *arg)
 {
     (void)arg;
     vTaskDelay(pdMS_TO_TICKS(500));
     if (!formation_requested) {
         formation_requested = true;
-        ezb_bdb_start_top_level_commissioning(
-            EZB_BDB_MODE_NETWORK_FORMATION);
+        ezb_bdb_start_top_level_commissioning(EZB_BDB_MODE_NETWORK_FORMATION);
     }
     vTaskDelete(NULL);
 }
@@ -1743,9 +1332,7 @@ static void deferred_formation_task(void *arg)
 static void hub_ready_task(void *arg)
 {
     (void)arg;
-    while (!g_rejoin_complete) {
-        vTaskDelay(pdMS_TO_TICKS(500));
-    }
+    while (!g_rejoin_complete) vTaskDelay(pdMS_TO_TICKS(500));
     uart_master_send_hub_ready();
     vTaskDelete(NULL);
 }
@@ -1757,28 +1344,24 @@ static bool esp_zigbee_app_signal_handler(const ezb_app_signal_t *app_signal)
     case EZB_ZDO_SIGNAL_SKIP_STARTUP:
         if (!formation_task_started) {
             formation_task_started = true;
-            xTaskCreate(deferred_formation_task, "zb_form",
-                        3072, NULL, 5, NULL);
+            xTaskCreate(deferred_formation_task, "zb_form", 3072, NULL, 5, NULL);
         }
         break;
 
     case EZB_BDB_SIGNAL_FORMATION: {
         ezb_bdb_comm_status_t status =
-            *((ezb_bdb_comm_status_t *)
-              ezb_app_signal_get_params(app_signal));
+            *((ezb_bdb_comm_status_t *)ezb_app_signal_get_params(app_signal));
         if (status == EZB_BDB_STATUS_SUCCESS) {
             network_formed         = true;
             pairing_window_expired = false;
             pairing_active         = false;
-
             PROD_LOG(TAG, "Network formed PAN=0x%04hx CH=%d",
                      ezb_nwk_get_panid(), ezb_nwk_get_current_channel());
-
             g_rejoin_complete = false;
             xTaskCreate(rejoin_task,    "rejoin",    6144, NULL, 3, NULL);
             xTaskCreate(hub_ready_task, "hub_ready", 3072, NULL, 3, NULL);
         } else {
-            ESP_LOGW(TAG, "Formation failed (status=%d) — retry", (int)status);
+            ESP_LOGW(TAG, "Formation failed (%d) — retry", (int)status);
             formation_requested = false;
         }
         break;
@@ -1799,32 +1382,27 @@ static bool esp_zigbee_app_signal_handler(const ezb_app_signal_t *app_signal)
 
         PROD_LOG(TAG, "DEVICE_ANNCE short=0x%04hx IEEE=%s",
                  ann->short_addr, ieee_str);
-
         register_or_update_joined_sensor(ann->short_addr, ieee_str);
 
         ezb_zdo_active_ep_req_t req = {0};
         req.dst_nwk_addr               = ann->short_addr;
-        req.field.nwk_addr_of_interest  = ann->short_addr;
-        req.cb                          = active_ep_callback;
+        req.field.nwk_addr_of_interest = ann->short_addr;
+        req.cb                         = active_ep_callback;
         req.user_ctx = (void *)(uintptr_t)ann->short_addr;
         ezb_zdo_active_ep_req(&req);
         break;
     }
 
     case EZB_NWK_SIGNAL_PERMIT_JOIN_STATUS: {
-        uint8_t duration =
-            *(uint8_t *)ezb_app_signal_get_params(app_signal);
+        uint8_t duration = *(uint8_t *)ezb_app_signal_get_params(app_signal);
         pairing_active = (duration != 0);
-
         if (duration == 0 && !pairing_window_expired) {
             pairing_window_expired = true;
             print_sensor_summary();
-
             hub_config_t *c = lock_config();
             int total = c ? c->sensor_count : 0;
             if (c) unlock_config();
-            uart_master_send_pairing_complete(
-                (int)g_new_sensor_count, total);
+            uart_master_send_pairing_complete((int)g_new_sensor_count, total);
             g_new_sensor_count = 0;
         }
         break;
@@ -1835,10 +1413,6 @@ static bool esp_zigbee_app_signal_handler(const ezb_app_signal_t *app_signal)
     }
     return true;
 }
-
-// ============================================================================
-// COORDINATOR DEVICE SETUP — UNCHANGED
-// ============================================================================
 
 static esp_err_t esp_zigbee_create_coordinator_device(void)
 {
@@ -1856,7 +1430,7 @@ static esp_err_t esp_zigbee_create_coordinator_device(void)
     ezb_zcl_basic_cluster_desc_add_attr(basic_desc,
         EZB_ZCL_ATTR_BASIC_MANUFACTURER_NAME_ID, (void *)manufacturer_name);
     ezb_zcl_basic_cluster_desc_add_attr(basic_desc,
-        EZB_ZCL_ATTR_BASIC_MODEL_IDENTIFIER_ID,  (void *)model_identifier);
+        EZB_ZCL_ATTR_BASIC_MODEL_IDENTIFIER_ID, (void *)model_identifier);
 
     ESP_ERROR_CHECK(ezb_af_endpoint_add_cluster_desc(ep_desc,
         ezb_zcl_on_off_create_cluster_desc(NULL, EZB_ZCL_CLUSTER_SERVER)));
@@ -1869,67 +1443,47 @@ static esp_err_t esp_zigbee_create_coordinator_device(void)
     ESP_ERROR_CHECK(ezb_af_device_add_endpoint_desc(dev_desc, ep_desc));
     ESP_ERROR_CHECK(ezb_af_device_desc_register(dev_desc));
 
-    ezb_zcl_raw_command_handler_register(raw_frame_handler);
     ezb_zcl_core_action_handler_register(esp_zigbee_zcl_core_action_handler);
-
     return ESP_OK;
 }
 
 static esp_err_t esp_zigbee_setup_commissioning(void)
 {
     ezb_aps_secur_enable_distributed_security(false);
-    ESP_ERROR_CHECK(
-        ezb_bdb_set_primary_channel_set(ZIGBEE_PRIMARY_CHANNEL_MASK));
-    ESP_ERROR_CHECK(
-        ezb_bdb_set_secondary_channel_set(ZIGBEE_SECONDARY_CHANNEL_MASK));
-    ESP_ERROR_CHECK(
-        ezb_app_signal_add_handler(esp_zigbee_app_signal_handler));
+    ESP_ERROR_CHECK(ezb_bdb_set_primary_channel_set(ZIGBEE_PRIMARY_CHANNEL_MASK));
+    ESP_ERROR_CHECK(ezb_bdb_set_secondary_channel_set(ZIGBEE_SECONDARY_CHANNEL_MASK));
+    ESP_ERROR_CHECK(ezb_app_signal_add_handler(esp_zigbee_app_signal_handler));
     return ESP_OK;
 }
-
-// ============================================================================
-// PERSIST TASK — simplified (no door_closed_pending expiry)
-// ============================================================================
 
 static void persist_task(void *arg)
 {
     (void)arg;
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(1000));
-
         if (g_dirty) {
             hub_config_t *c = lock_config();
             if (c) {
                 esp_err_t err = save_config(c);
                 unlock_config();
-                if (err == ESP_OK)
-                    g_dirty = false;
-                else
-                    ESP_LOGW(TAG, "NVS save failed: %s",
-                             esp_err_to_name(err));
+                if (err == ESP_OK) g_dirty = false;
+                else ESP_LOGW(TAG, "NVS save failed: %s", esp_err_to_name(err));
             }
         }
     }
 }
-
-// ============================================================================
-// ZIGBEE STACK TASK — passive boot, waits for hub_init
-// ============================================================================
 
 static void esp_zigbee_stack_main_task(void *pvParameters)
 {
     (void)pvParameters;
 
     PROD_LOG(TAG, "Waiting for hub_init from Master...");
-    while (!g_hub_init_received) {
-        vTaskDelay(pdMS_TO_TICKS(100));
-    }
+    while (!g_hub_init_received) vTaskDelay(pdMS_TO_TICKS(100));
     PROD_LOG(TAG, "hub_init received — starting Zigbee (mode=%s)",
              g_hub_init_mode_debug ? "debug" : "production");
 
     esp_zigbee_config_t zigbee_config = {0};
-    zigbee_config.device_config.device_type =
-        EZB_NWK_DEVICE_TYPE_COORDINATOR;
+    zigbee_config.device_config.device_type = EZB_NWK_DEVICE_TYPE_COORDINATOR;
     zigbee_config.device_config.install_code_policy      = false;
     zigbee_config.device_config.zczr_config.max_children = MAX_SENSORS;
     zigbee_config.platform_config.storage_partition_name =
@@ -1947,17 +1501,13 @@ static void esp_zigbee_stack_main_task(void *pvParameters)
     vTaskDelete(NULL);
 }
 
-// ============================================================================
-// APP ENTRY POINT
-// ============================================================================
-
 void app_main(void)
 {
-    print_banner();
+    printf("\nINNOVATSII EMS - SENSOR HUB v%s\n", FIRMWARE_VERSION);
+    fflush(stdout);
 
     ESP_ERROR_CHECK(nvs_flash_init());
-    ESP_ERROR_CHECK(
-        nvs_flash_init_partition(ESP_ZIGBEE_STORAGE_PARTITION_NAME));
+    ESP_ERROR_CHECK(nvs_flash_init_partition(ESP_ZIGBEE_STORAGE_PARTITION_NAME));
 
 #if FACTORY_RESET_MODE
     ESP_LOGW(TAG, "FACTORY RESET — erasing NVS");
@@ -1975,20 +1525,16 @@ void app_main(void)
     load_config(&g_config.data);
 
     esp_err_t uart_err = uart_master_init();
-    if (uart_err != ESP_OK) {
+    if (uart_err != ESP_OK)
         ESP_LOGW(TAG, "UART init failed (%s)", esp_err_to_name(uart_err));
-    }
 
     PROD_LOG(TAG, "v%s ready — waiting for Master ping", FIRMWARE_VERSION);
 
-    xTaskCreate(esp_zigbee_stack_main_task, "Zigbee_main",
-                4096 * 2, NULL, 5, NULL);
+    xTaskCreate(esp_zigbee_stack_main_task, "Zigbee_main", 8192, NULL, 5, NULL);
     xTaskCreate(persist_task,          "persist",    2048, NULL, 3, NULL);
     xTaskCreate(model_id_timeout_task, "id_timeout", 2048, NULL, 2, NULL);
 
 #if WATCHDOG_ENABLE
-    xTaskCreate(sensor_watchdog_task, "watchdog",   3072, NULL, 2, NULL);
-#else
-    PROD_LOG(TAG, "Watchdog disabled");
+    xTaskCreate(sensor_watchdog_task, "watchdog", 3072, NULL, 2, NULL);
 #endif
 }
