@@ -1,16 +1,14 @@
 /*
  * uart_master.h
  * Sensor Hub <-> Master UART Communication Layer
- * Innovatsii EMS — Pico 1
- * Firmware Version: 0.2.5
+ * Innovatsii EMS — Pico 1  |  Firmware 0.2.5
  *
- * V4.2+ changes:
+ * V4.2+:
  *   - hub_aggregate replaces unit_occupancy
- *   - UTC timestamps on all messages (from g_utc_boot_epoch + uptime)
- *   - uart_master_send_hub_aggregate() added
- *   - uart_master_send_unit_occupancy() removed
- *   - utc_epoch parsed from hub_init and stored in g_utc_boot_epoch
- *   - presence_fading_time_sec guard changed: 0 is now valid (no hold time)
+ *   - UTC timestamps on all messages (g_utc_boot_epoch + uptime)
+ *   - presence_fading_time_sec: 0 is valid (no hold)
+ *   - motion_sensitivity global default added
+ *   - set_sensor_config command support (per-sensor fading/sensitivity)
  */
 
 #ifndef UART_MASTER_H
@@ -61,8 +59,9 @@ typedef struct {
     uint16_t watchdog_ping_timeout_sec;
     uint16_t door_alarm_threshold_min;
     uint16_t heartbeat_interval_min;
-    uint16_t presence_fading_time_sec;       /* 0 = no hold (valid) */
+    uint16_t presence_fading_time_sec;       /* 0..28800; global default */
     uint16_t door_sensor_max_silence_hours;
+    uint16_t motion_sensitivity;             /* 0..19; global default    */
 } uart_hub_config_t;
 
 // ============================================================================
@@ -101,13 +100,7 @@ void uart_master_send_pairing_complete(int new_sensors, int total_sensors);
 // OUTBOUND — Runtime
 // ============================================================================
 
-/*
- * hub_aggregate: replaces unit_occupancy.
- * Simple OR of all online presence sensors — no door logic.
- * Master uses this + door events to calculate unit occupancy.
- */
 void uart_master_send_hub_aggregate(const char *state);
-
 void uart_master_send_sensor_presence(const char *sensor_name,
                                       const char *model, bool presence);
 void uart_master_send_environment(const char *sensor_name,

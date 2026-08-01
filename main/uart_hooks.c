@@ -2,14 +2,14 @@
  * uart_hooks.c
  * Bridge between uart_master.c commands and main.c / Zigbee stack.
  *
- * uart_master.c → uart_hooks.c → main.c / Zigbee stack
+ *   uart_master.c → uart_hooks.c → main.c / Zigbee stack
  *
- * These functions are called by uart_master.c command handlers.
- * Keeping them here means uart_master.c has zero dependency on main.c.
+ * remove_sensor shifts g_meta[] and clears the freed slot so a re-paired
+ * sensor gets a fresh binding. This is the ONLY place bound_once is reset —
+ * never on re-announce, never on reboot.
  *
- * remove_sensor: also resets g_meta[idx].bound_once so the sensor
- * will be fully re-bound if it re-pairs. This is the ONLY place
- * bound_once is reset — never on re-announce, never on reboot.
+ * set_sensor_config forwards fading_time / motion sensitivity to a presence
+ * sensor via Tuya EF00 datapoint writes (DP 102 / DP 2), exactly like Z2M.
  */
 
 #include "uart_master.h"
@@ -56,26 +56,47 @@ void uart_cmd_remove_sensor(int idx)
         return;
     }
 
-    /* Shift remaining sensors down */
+    /* Shift sensors down, then g_meta down, then clear the freed slot. */
     for (int i = idx; i < c->sensor_count - 1; i++)
         c->sensors[i] = c->sensors[i + 1];
     memset(&c->sensors[c->sensor_count - 1], 0, sizeof(sensor_t));
-    c->sensor_count--;
 
-    /*
-     * Shift g_meta array to match.
-     * Reset bound_once for removed slot — if sensor re-pairs it gets
-     * a full fresh binding. This is the ONLY place bound_once is reset.
-     */
-    for (int i = idx; i < c->sensor_count; i++)
+    for (int i = idx; i < c->sensor_count - 1; i++)
         g_meta[i] = g_meta[i + 1];
-    memset(&g_meta[c->sensor_count], 0, sizeof(sensor_runtime_meta_t));
+    memset(&g_meta[c->sensor_count - 1], 0, sizeof(sensor_runtime_meta_t));
 
+    c->sensor_count--;
     int remaining = c->sensor_count;
     unlock_config();
 
     mark_dirty();
     ESP_LOGI(TAG, "Sensor %d removed — %d remaining", idx, remaining);
+}
+
+/*
+ * uart_cmd_set_sensor_config — apply fading_time and/or motion sensitivity
+ * to a presence sensor. Pass -1 for any field to leave it unchanged.
+ *   fading_sec  : 0..28800   (motion keep time, seconds)
+ *   sensitivity : 0..19      (motion detection sensitivity)
+ * main.c validates ranges, persists in g_meta[], and sends the Tuya DP write.
+ */
+void uart_cmd_set_sensor_config(int idx, int fading_sec, int sensitivity)
+{
+    if (idx < 0 || idx >= MAX_SENSORS) return;
+
+    hub_config_t *c = lock_config();
+    if (!c) return;
+    if (idx >= c->sensor_count) {
+        unlock_config();
+        ESP_LOGW(TAG, "set_sensor_config: index %d out of range (count=%d)",
+                 idx, c->sensor_count);
+        return;
+    }
+    unlock_config();
+
+    ESP_LOGI(TAG, "set_sensor_config idx=%d fading=%d sensitivity=%d",
+             idx, fading_sec, sensitivity);
+    hub_set_sensor_config(idx, fading_sec, sensitivity);
 }
 
 void uart_cmd_factory_reset(void)

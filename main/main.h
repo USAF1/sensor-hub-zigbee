@@ -1,34 +1,14 @@
 /*
  * main.h — Sensor Hub Zigbee Coordinator
- * Innovatsii EMS — Pico 1
- * Firmware Version: 0.2.5
+ * Innovatsii EMS — Pico 1  |  Firmware 0.2.5
  *
- * V4.2+ Architecture — Hub is pure data reporter:
- *
- *   Hub responsibilities:
- *     - Sensor identification (ZG-204ZV, ZG-205Z/A, ZG-102Z)
- *     - Raw sensor event reporting (presence, door, battery, environment)
- *     - Hub aggregate = OR of all online presence sensors (no door logic)
- *     - Real UTC timestamps on all outbound messages
- *     - Watchdog for always-on sensors
- *     - Never calculates unit occupancy
- *
- *   Master responsibilities (moved from Hub):
- *     - Unit occupancy calculation from door + presence events
- *     - Buffer period
- *     - Booking window + 4-state decision
- *     - Relay control
- *
- *   UTC timestamp:
- *     Hub receives utc_epoch in hub_init.
- *     All outbound messages use: utc_epoch + uptime_seconds
- *
- *   hub_aggregate:
- *     Replaces unit_occupancy. Simple OR of online presence sensors.
- *     No door sensor involvement.
- *     Sent to Master on every change.
- *
- *   Sensor joining logic: UNCHANGED from working version.
+ * Hub is a pure data reporter:
+ *   - Identifies sensors (ZG-204ZV, ZG-205Z/A, ZG-102Z/ZA)
+ *   - Presence via Tuya EF00 DP 1; door via IAS Zone; battery via PowerConfig
+ *   - Writes fading_time (DP 102) and motion sensitivity (DP 2) to mmWave
+ *   - hub_aggregate = OR of online presence sensors (no door logic)
+ *   - Persists sensors + network; instant rejoin on reboot
+ *   - Never calculates unit occupancy (Master does that)
  */
 
 #ifndef MAIN_H
@@ -67,8 +47,9 @@
 #define REJOIN_RETRY_DELAY_MS 10000
 #define REJOIN_POLL_GAP_MS    500
 
-/* ZG-204ZV fading time default — 0 means no hold (sensor goes NO immediately) */
-#define PRESENCE_FADING_TIME_DEFAULT_SEC 0
+/* Presence sensor config defaults (written via Tuya EF00 at join) */
+#define PRESENCE_FADING_TIME_DEFAULT_SEC 30
+#define PRESENCE_SENSITIVITY_DEFAULT     9
 
 /* Model ID read timeout — ZG-102Z (sleepy) never responds → infer door type */
 #define MODEL_ID_TIMEOUT_MS  5000
@@ -142,9 +123,7 @@ typedef struct {
 } hub_status_t;
 
 typedef struct {
-    /* Hub aggregate — simple presence OR, no door logic */
-    hub_status_t     hub_status;
-
+    hub_status_t     hub_status;   /* presence OR, no door logic */
     sensor_t         sensors[MAX_SENSORS];
     uint8_t          sensor_count;
     hub_mode_t       mode;
@@ -179,6 +158,9 @@ typedef struct {
     uint8_t           miss_count;
     uint8_t           rejoin_count;
 
+    uint16_t          fade_value;   /* current fading_time (s)  — pushed at join */
+    uint8_t           sens_value;   /* current sensitivity 0-19 — pushed at join */
+
     bool              enroll_sent;
 } sensor_runtime_meta_t;
 
@@ -206,5 +188,9 @@ void          mark_dirty(void);
 const char   *friendly_name_from_type(sensor_type_t t);
 const char   *hub_aggregate_str(hub_aggregate_t a);
 const char   *role_str(sensor_role_t r);
+
+/* Push fading_time / motion sensitivity to a presence sensor.
+ * Pass -1 for a field to leave it unchanged. Implemented in main.c. */
+void          hub_set_sensor_config(int idx, int fading_sec, int sensitivity);
 
 #endif /* MAIN_H */
