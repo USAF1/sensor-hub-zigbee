@@ -3,25 +3,15 @@
  * Innovatsii EMS — Pico 1  |  Firmware 0.2.5
  *
  * Behaviour mirrors Zigbee2MQTT for HOBEIAN/Tuya sensors:
+ *   Presence  = Tuya EF00 DP 1 (enum). Door = IAS Zone 0x0500.
+ *   Battery   = PowerConfig 0x0001. Temp/hum = 0x0402 / 0x0405.
+ *   Config    = Tuya EF00 dataRequest: fading_time DP 102, sensitivity DP 2.
+ *   mmWave IAS presence ignored; mmWave never pinged.
  *
- *   Decode (Tuya EF00 cluster 0xEF00, dataReport cmd 0x02):
- *     ZG-204ZV / ZG-205Z/A  presence  = DP 1  (enum, 1=YES)
- *     ZG-204ZV              temp/hum  = standard clusters 0x0402 / 0x0405
- *     ZG-204ZV / 205        illumin.  = ignored
- *     battery (204ZV/102Z)            = PowerConfig 0x0001 attr 0x0021 (raw/2)
- *     ZG-102Z / ZA          contact   = IAS Zone 0x0500 statusChangeNotification
- *
- *   Configure (Tuya EF00 dataRequest cmd 0x00, DP value type 0x02, 4-byte BE):
- *     fading_time                    = DP 102
- *     motion_detection_sensitivity   = DP 2
- *
- *   Presence is taken ONLY from the Tuya DP (sensor-debounced). IAS Zone
- *   presence for mmWave is ignored — it is the noisy channel that caused
- *   oscillation. mmWave sensors are never pinged.
- *
- *   Rejoin: network is persisted in zb_storage. On boot the coordinator
- *   forms the network only if factory-new, otherwise resumes it and lets
- *   sleepy devices re-announce and rejoin instantly (Z2M behaviour).
+ * Commissioning: always start BDB NETWORK_FORMATION. Factory-new forms a new
+ * network; an existing network resumes (formation becomes a no-op / returns
+ * FORMATION_FAILURE which we treat as "resumed"). Either way the coordinator
+ * ends up commissioned and able to accept joins when permit-join opens.
  */
 
 #include <stdio.h>
@@ -70,8 +60,14 @@
 
 #define TAG "SENSOR_HUB"
 
-/* Production: never wipe NVS on boot — sensors and network must persist. */
-#define FACTORY_RESET_MODE  0
+/*
+ * FACTORY_RESET_MODE:
+ *   0 = normal (persist app NVS + Zigbee network across reboots)
+ *   1 = wipe BOTH the app NVS AND the zb_storage partition on boot, so the
+ *       coordinator comes up genuinely factory-new and forms a fresh network.
+ *       Use this once to recover from a stale/mismatched zb_storage.
+ */
+#define FACTORY_RESET_MODE  1
 #define WATCHDOG_ENABLE     1
 
 #define ZIGBEE_PRIMARY_CHANNEL_MASK   0x07FFF800UL
@@ -79,11 +75,9 @@
 
 #define MODEL_ID_TIMEOUT_MS 5000
 
-/* Config defaults written to presence sensors at join. */
 #define DEFAULT_FADING_TIME_SEC   30
 #define DEFAULT_SENSITIVITY       9
 
-/* ZCL clusters / attributes */
 #define CLUSTER_BASIC             0x0000
 #define CLUSTER_POWER_CONFIG      0x0001
 #define CLUSTER_TEMP_MEASUREMENT  0x0402
@@ -97,24 +91,26 @@
 #define ATTR_HUMIDITY_MEASURED      0x0000
 #define ATTR_BATTERY_PERCENT        0x0021
 
-/* Tuya EF00 datapoints (confirmed against Z2M) */
-#define TUYA_DP_PRESENCE      1     /* enum:  1 = occupied */
-#define TUYA_DP_SENSITIVITY   2     /* value: 0..19        */
-#define TUYA_DP_FADING_TIME   102   /* value: seconds      */
+#define TUYA_DP_PRESENCE      1
+#define TUYA_DP_SENSITIVITY   2
+#define TUYA_DP_FADING_TIME   102
 
-/* Tuya ZCL commands on cluster 0xEF00 */
-#define TUYA_CMD_DATA_REQUEST 0x00  /* coordinator -> device (set) */
-#define TUYA_CMD_DATA_REPORT  0x02  /* device -> coordinator       */
+#define TUYA_CMD_DATA_REQUEST 0x00
+#define TUYA_CMD_DATA_REPORT  0x02
 
-/* Tuya DP datatypes */
 #define TUYA_TYPE_RAW   0x00
 #define TUYA_TYPE_BOOL  0x01
 #define TUYA_TYPE_VALUE 0x02
 #define TUYA_TYPE_ENUM  0x04
 
-/* Standard IAS Zone bind is required so door sensors enroll. */
 static const uint16_t k_bind_clusters[] = { CLUSTER_IAS_ZONE };
 #define BIND_COUNT (sizeof(k_bind_clusters) / sizeof(k_bind_clusters[0]))
+
+/* Forward declarations for boot/rejoin tasks (used before their definitions). */
+static void rejoin_task(void *arg);
+static void hub_ready_task(void *arg);
+static void configure_reporting(int idx, uint16_t sa, uint8_t ep);
+static void request_model_id(int idx, uint16_t sa, uint8_t ep);
 
 static void uptime_str(char *buf, size_t len)
 {
@@ -262,7 +258,6 @@ static void restore_meta_from_nvs(hub_config_t *config)
     }
 }
 
-/* Hub aggregate — OR of online presence sensors. Door excluded. Lock held. */
 static void update_hub_aggregate_locked(hub_config_t *c)
 {
     bool any = false;
@@ -324,7 +319,7 @@ esp_err_t load_config(hub_config_t *config)
     uint8_t mode = MODE_PAIRING;
     nvs_get_u8(h, "mode", &mode);
     config->mode = (hub_mode_t)mode;
-    config->hub_status.aggregate = HUB_AGG_VACANT; /* always start vacant */
+    config->hub_status.aggregate = HUB_AGG_VACANT;
 
     uint8_t count = 0;
     nvs_get_u8(h, "sensor_count", &count);
@@ -360,7 +355,6 @@ static void register_or_update(uint16_t short_addr, const char *ieee)
         memset(&g_meta[idx], 0, sizeof(sensor_runtime_meta_t));
         reset_meta_runtime(idx);
     } else {
-        /* Re-announce: refresh short addr, keep identity + config. */
         g_meta[idx].reporting_configured = false;
         g_meta[idx].fade_sent            = false;
         g_meta[idx].power_config_bound   = false;
@@ -395,13 +389,8 @@ static void register_or_update(uint16_t short_addr, const char *ieee)
     mark_dirty();
 }
 
-/* ── Tuya EF00 write (byte-identical to Z2M) ─────────────────────────────── */
-/*
- * Payload layout (matches Z2M manuSpecificTuya.dataRequest):
- *   [frameCtrl=0x11][seq_lo][seq_hi][cmd=0x00][dp][type=0x02][len_hi=0][len_lo=4]
- *   [v24][v16][v8][v0]
- * frameCtrl 0x11 = cluster-specific, direction to server, disable default rsp.
- */
+/* ── Tuya EF00 write ─────────────────────────────────────────────────────── */
+
 typedef struct { uint16_t sa; uint8_t ep; uint8_t dp; uint32_t val; } tuya_write_t;
 
 static void tuya_write_task(void *arg)
@@ -427,7 +416,7 @@ static void tuya_write_task(void *arg)
     cmd.cmd_ctrl.fc.direction          = EZB_ZCL_CMD_DIRECTION_TO_SRV;
     cmd.cmd_ctrl.fc.dis_default_rsp    = 1;
     cmd.cmd_id                         = TUYA_CMD_DATA_REQUEST;
-    cmd.data_length                    = sizeof(payload) - 4; /* frameCtrl..cmd handled by cmd_id; send DP body */
+    cmd.data_length                    = sizeof(payload) - 4;
     cmd.data                           = &payload[4];
 
     esp_zigbee_lock_acquire(portMAX_DELAY);
@@ -448,7 +437,6 @@ static void tuya_write_dp(uint16_t sa, uint8_t ep, uint8_t dp, uint32_t val)
     xTaskCreate(tuya_write_task, "tuyawr", 3072, w, 3, NULL);
 }
 
-/* Public: called by uart_hooks when the Master pushes a new sensitivity/fade. */
 void hub_set_sensor_config(int idx, int fading_sec, int sensitivity)
 {
     if (idx < 0 || idx >= MAX_SENSORS) return;
@@ -514,7 +502,6 @@ static void configure_reporting(int idx, uint16_t sa, uint8_t ep)
     unlock_config();
     if (t == SENSOR_UNKNOWN) return;
 
-    /* Bind + report battery (PowerConfig) for battery-powered devices. */
     if (!g_meta[idx].power_config_bound) {
         ezb_extaddr_t si, ci;
         ezb_get_extended_address(&ci);
@@ -555,7 +542,6 @@ static void configure_reporting(int idx, uint16_t sa, uint8_t ep)
         g_meta[idx].reporting_configured = true;
     }
 
-    /* Push fading + sensitivity to presence sensors (Tuya DP writes). */
     if ((t == SENSOR_ZG_204ZV || t == SENSOR_ZG_205Z_A) && !g_meta[idx].fade_sent) {
         tuya_write_dp(sa, ep, TUYA_DP_FADING_TIME, g_meta[idx].fade_value);
         tuya_write_dp(sa, ep, TUYA_DP_SENSITIVITY, g_meta[idx].sens_value);
@@ -660,7 +646,6 @@ static void mark_online_locked(hub_config_t *c, int idx)
     }
 }
 
-/* Presence from Tuya EF00 DP 1 — the ONLY presence source for mmWave. */
 static void handle_presence(int idx, bool occupied)
 {
     hub_config_t *c = lock_config();
@@ -689,11 +674,6 @@ static uint32_t be32(const uint8_t *p) {
            ((uint32_t)p[2] << 8) | (uint32_t)p[3];
 }
 
-/*
- * Raw Tuya EF00 frame. Layout after the ZCL header:
- *   [status][seq_hi][seq_lo][dp][type][len_hi][len_lo][data...]
- * We only act on the presence DP; all other DPs are telemetry/config echoes.
- */
 static bool raw_frame_handler(const ezb_zcl_raw_frame_t *raw)
 {
     if (!raw || !raw->header) return false;
@@ -706,7 +686,6 @@ static bool raw_frame_handler(const ezb_zcl_raw_frame_t *raw)
 
     const uint8_t *p = raw->payload;
     uint16_t len = raw->payload_length;
-    /* Skip 3-byte Tuya header (status + seq16) to first DP. */
     uint16_t i = 3;
     while (i + 4 <= len) {
         uint8_t dp   = p[i];
@@ -769,7 +748,6 @@ static void ias_enroll_handler(ezb_zcl_ias_zone_enroll_req_message_t *m)
     if (idx >= 0) g_meta[idx].enroll_sent = true;
 }
 
-/* IAS Zone status — ONLY door sensors. mmWave IAS is ignored (noisy). */
 static void ias_status_handler(ezb_zcl_ias_zone_status_change_notif_message_t *m)
 {
     if (!m || !m->in.header) return;
@@ -813,7 +791,6 @@ static void ias_status_handler(ezb_zcl_ias_zone_status_change_notif_message_t *m
             return;
         }
     }
-    /* mmWave IAS presence intentionally ignored — presence comes from Tuya DP1. */
     unlock_config();
 }
 
@@ -865,7 +842,7 @@ static void zcl_action_handler(ezb_zcl_core_action_callback_id_t id, void *msg)
     }
 }
 
-/* ── Watchdog: door sensors never pinged; mmWave never pinged (Z2M-style) ── */
+/* ── Watchdog ────────────────────────────────────────────────────────────── */
 
 #if WATCHDOG_ENABLE
 static void watchdog_task(void *arg)
@@ -926,12 +903,6 @@ static void rejoin_task(void *arg)
         return;
     }
 
-    /*
-     * Z2M-style rejoin: the network is already restored. Sleepy devices
-     * re-announce on their own when they next wake. We simply report the
-     * persisted registry to the Master and wait for DEVICE_ANNCE to bring
-     * each sensor online. No Leave/steer needed.
-     */
     PROD_LOG(TAG, "[JOIN] Network resumed — %d sensor(s) awaiting rejoin", n);
     int online = 0, offline = 0;
     hub_config_t *cc = lock_config();
@@ -958,23 +929,36 @@ static void hub_ready_task(void *arg)
     vTaskDelete(NULL);
 }
 
+static void start_ready_tasks_once(void)
+{
+    static bool started = false;
+    if (started) return;
+    started = true;
+    g_rejoin_complete = false;
+    xTaskCreate(rejoin_task,    "rejoin",    4096, NULL, 3, NULL);
+    xTaskCreate(hub_ready_task, "hub_ready", 3072, NULL, 3, NULL);
+}
+
 static void deferred_formation_task(void *arg)
 {
     (void)arg;
     vTaskDelay(pdMS_TO_TICKS(500));
-    /* Only FORM if factory-new. Otherwise the stack resumes the saved network. */
-    if (ezb_bdb_is_factory_new()) {
-        if (!formation_requested) {
-            formation_requested = true;
+
+    /*
+     * Always start BDB NETWORK_FORMATION.
+     *  - Factory-new  -> forms a fresh network.
+     *  - Existing net -> stack resumes it; formation may return
+     *    FORMATION_FAILURE (harmless: "already on a network"). Either way
+     *    the coordinator ends up commissioned and can accept joins.
+     * This is the fix for pairing failing after a resume.
+     */
+    if (!formation_requested) {
+        formation_requested = true;
+        if (ezb_bdb_is_factory_new())
             PROD_LOG(TAG, "Factory-new — forming network");
-            ezb_bdb_start_top_level_commissioning(EZB_BDB_MODE_NETWORK_FORMATION);
-        }
-    } else {
-        PROD_LOG(TAG, "Existing network — resuming (instant rejoin enabled)");
-        network_formed = true;
-        g_rejoin_complete = false;
-        xTaskCreate(rejoin_task,    "rejoin",    4096, NULL, 3, NULL);
-        xTaskCreate(hub_ready_task, "hub_ready", 3072, NULL, 3, NULL);
+        else
+            PROD_LOG(TAG, "Existing network — resuming via BDB commissioning");
+        ezb_bdb_start_top_level_commissioning(EZB_BDB_MODE_NETWORK_FORMATION);
     }
     vTaskDelete(NULL);
 }
@@ -992,17 +976,18 @@ static bool app_signal_handler(const ezb_app_signal_t *sig)
 
     case EZB_BDB_SIGNAL_FORMATION: {
         ezb_bdb_comm_status_t st = *((ezb_bdb_comm_status_t *)ezb_app_signal_get_params(sig));
+        network_formed = true; pairing_window_expired = false; pairing_active = false;
         if (st == EZB_BDB_STATUS_SUCCESS) {
-            network_formed = true; pairing_window_expired = false; pairing_active = false;
             PROD_LOG(TAG, "Network formed PAN=0x%04hx CH=%d",
                      ezb_nwk_get_panid(), ezb_nwk_get_current_channel());
-            g_rejoin_complete = false;
-            xTaskCreate(rejoin_task,    "rejoin",    4096, NULL, 3, NULL);
-            xTaskCreate(hub_ready_task, "hub_ready", 3072, NULL, 3, NULL);
         } else {
-            ESP_LOGW(TAG, "Formation failed (%d) — retry", (int)st);
-            formation_requested = false;
+            /* Existing network — formation "fails" because one already exists.
+             * This is the RESUME case, not an error. */
+            PROD_LOG(TAG, "Formation returned %d — resumed existing network "
+                          "PAN=0x%04hx CH=%d", (int)st,
+                     ezb_nwk_get_panid(), ezb_nwk_get_current_channel());
         }
+        start_ready_tasks_once();
         break;
     }
 
@@ -1110,7 +1095,7 @@ static void zigbee_main_task(void *arg)
     ESP_ERROR_CHECK(esp_zigbee_init(&zc));
     ESP_ERROR_CHECK(setup_commissioning());
     ESP_ERROR_CHECK(create_coordinator());
-    ESP_ERROR_CHECK(esp_zigbee_start(false)); /* false = resume saved network */
+    ESP_ERROR_CHECK(esp_zigbee_start(false));
     ESP_ERROR_CHECK(esp_zigbee_launch_mainloop());
     esp_zigbee_deinit();
     vTaskDelete(NULL);
@@ -1125,7 +1110,10 @@ void app_main(void)
     ESP_ERROR_CHECK(nvs_flash_init_partition(ESP_ZIGBEE_STORAGE_PARTITION_NAME));
 
 #if FACTORY_RESET_MODE
-    ESP_LOGW(TAG, "FACTORY RESET — erasing NVS");
+    ESP_LOGW(TAG, "FACTORY RESET — erasing app NVS AND zb_storage");
+    nvs_flash_deinit_partition(ESP_ZIGBEE_STORAGE_PARTITION_NAME);
+    nvs_flash_erase_partition(ESP_ZIGBEE_STORAGE_PARTITION_NAME);
+    nvs_flash_init_partition(ESP_ZIGBEE_STORAGE_PARTITION_NAME);
     nvs_flash_erase();
     nvs_flash_init();
 #endif
