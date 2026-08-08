@@ -1,15 +1,15 @@
 /*
  * uart_hooks.c
- * Bridge between uart_master.c commands and main.c / Zigbee stack.
+ * Bridge between uart_master.c commands and Zigbee stack.
  *
- *   uart_master.c → uart_hooks.c → main.c / Zigbee stack
+ *   uart_master.c → uart_hooks.c → Zigbee stack / tuya_ef00.c
  *
  * remove_sensor shifts g_meta[] and clears the freed slot so a re-paired
  * sensor gets a fresh binding. This is the ONLY place bound_once is reset —
  * never on re-announce, never on reboot.
  *
- * set_sensor_config forwards fading_time / motion sensitivity to a presence
- * sensor via Tuya EF00 datapoint writes (DP 102 / DP 2), exactly like Z2M.
+ * set_sensor_config forwards keep_time_sec / sensitivity to a ZG-204ZL PIR
+ * sensor via Tuya EF00 datapoint writes (DP10 / DP9), using enum datatype.
  */
 
 #include "uart_master.h"
@@ -74,13 +74,13 @@ void uart_cmd_remove_sensor(int idx)
 }
 
 /*
- * uart_cmd_set_sensor_config — apply fading_time and/or motion sensitivity
- * to a presence sensor. Pass -1 for any field to leave it unchanged.
- *   fading_sec  : 0..28800   (motion keep time, seconds)
- *   sensitivity : 0..19      (motion detection sensitivity)
- * main.c validates ranges, persists in g_meta[], and sends the Tuya DP write.
+ * uart_cmd_set_sensor_config — apply keep_time_sec and/or sensitivity
+ * to a ZG-204ZL PIR presence sensor. Pass -1 for any field to leave
+ * it unchanged.
+ *   keep_time_sec : one of {10, 30, 60, 120} — mapped to DP10 enum
+ *   sensitivity   : 0=low, 1=medium, 2=high   — mapped to DP9 enum
  */
-void uart_cmd_set_sensor_config(int idx, int fading_sec, int sensitivity)
+void uart_cmd_set_sensor_config(int idx, int keep_time_sec, int sensitivity)
 {
     if (idx < 0 || idx >= MAX_SENSORS) return;
 
@@ -94,9 +94,9 @@ void uart_cmd_set_sensor_config(int idx, int fading_sec, int sensitivity)
     }
     unlock_config();
 
-    ESP_LOGI(TAG, "set_sensor_config idx=%d fading=%d sensitivity=%d",
-             idx, fading_sec, sensitivity);
-    hub_set_sensor_config(idx, fading_sec, sensitivity);
+    ESP_LOGI(TAG, "set_sensor_config idx=%d keep_time=%d sensitivity=%d",
+             idx, keep_time_sec, sensitivity);
+    hub_set_sensor_config(idx, keep_time_sec, sensitivity);
 }
 
 void uart_cmd_factory_reset(void)

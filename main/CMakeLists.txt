@@ -3,7 +3,16 @@ idf_component_register(
         "main.c"
         "uart_master.c"
         "uart_hooks.c"
-    PRIV_INCLUDE_DIRS "."
+        "sensor_registry.c"
+        "sensor_identify.c"
+        "zcl_dispatch.c"
+        "zigbee_core.c"
+        "hub_aggregate.c"
+        "tuya_ef00.c"
+        "devices/sensor_driver.c"
+        "devices/pir_zg204zl.c"
+        "devices/door_zg102z.c"
+    PRIV_INCLUDE_DIRS "." "devices"
     PRIV_REQUIRES
         nvs_flash
         esp_wifi

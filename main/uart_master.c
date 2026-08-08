@@ -505,8 +505,8 @@ static void cmd_set_sensor_config(const char *json, uint16_t len)
     sensor_type_t t = (sensor_type_t)c->sensors[idx].sensor_type;
     unlock_config();
 
-    if (t != SENSOR_ZG_204ZV && t != SENSOR_ZG_205Z_A) {
-        ESP_LOGW(TAG, "set_sensor_config: idx %ld not a presence sensor", (long)idx);
+    if (t != SENSOR_ZG_204ZL) {
+        ESP_LOGW(TAG, "set_sensor_config: idx %ld not a PIR sensor", (long)idx);
         uart_master_send_ack("set_sensor_config", false);
         return;
     }
@@ -751,18 +751,6 @@ void uart_master_send_sensor_presence(const char *name, const char *model, bool 
                 name ? name : "", model ? model : "", p ? "YES" : "NO", ts);
 }
 
-void uart_master_send_environment(const char *name, float temp_c, float hum_pct)
-{
-    char ts[32]; utc_str(ts, sizeof(ts));
-    int32_t t = (int32_t)(temp_c  * 100.0f);
-    int32_t h = (int32_t)(hum_pct * 100.0f);
-    tx_send_fmt("{\"type\":\"environment\",\"sensor\":\"%s\",\"temp_c_x100\":%ld,"
-                "\"hum_pct_x100\":%ld,\"ts_utc\":\"%s\"}",
-                name ? name : "", (long)t, (long)h, ts);
-    ESP_LOGI(TAG, "TX environment sensor=%s temp=%.2f hum=%.2f",
-             name ? name : "", (double)temp_c, (double)hum_pct);
-}
-
 void uart_master_send_door(const char *name, bool is_open)
 {
     char ts[32]; utc_str(ts, sizeof(ts));
@@ -851,16 +839,17 @@ void uart_master_send_heartbeat(void)
                s->contact_open ? "OPEN" : "CLOSED",
                s->battery_pct, s_ts);
         } else {
+            /* PRESENCE sensor (ZG-204ZL PIR).
+             * keep_time_sec and sensitivity reported; no temp/hum. */
             HB("{\"name\":\"%s\",\"model\":\"%s\",\"role\":\"PRESENCE\","
                "\"online\":%s,\"presence\":%s,\"battery\":%u,"
-               "\"temp_c_x100\":%d,\"hum_pct_x100\":%d,"
-               "\"fading_time\":%u,\"sensitivity\":%u,"
+               "\"keep_time_sec\":%u,\"sensitivity\":%u,"
                "\"last_seen_utc\":\"%s\"}",
                s->sensor_name, friendly_name_from_type(t),
                s->online ? "true" : "false",
                s->presence ? "true" : "false",
-               s->battery_pct, s->temperature_cdeg, s->humidity_cpct,
-               (unsigned)g_meta[i].fade_value, (unsigned)g_meta[i].sens_value,
+               s->battery_pct,
+               (unsigned)g_meta[i].keep_time_sec, (unsigned)g_meta[i].sensitivity,
                s_ts);
         }
     }
@@ -902,16 +891,16 @@ void uart_master_send_config_response(void)
             sensor_t *s = &c->sensors[i];
             sensor_type_t st = (sensor_type_t)s->sensor_type;
             sensor_role_t role = (sensor_role_t)s->sensor_role;
-            bool is_presence = (st == SENSOR_ZG_204ZV || st == SENSOR_ZG_205Z_A);
+            bool is_pir = (st == SENSOR_ZG_204ZL);
             if (i > 0) CR(",");
             CR("{\"index\":%d,\"name\":\"%s\",\"model\":\"%s\",\"role\":\"%s\","
-               "\"online\":%s,\"battery\":%u,\"fading_time\":%u,"
+               "\"online\":%s,\"battery\":%u,\"keep_time_sec\":%u,"
                "\"sensitivity\":%u,\"supports_config\":%s}",
                i, s->sensor_name, friendly_name_from_type(st),
                role == ROLE_DOOR ? "DOOR" : "PRESENCE",
                s->online ? "true" : "false", s->battery_pct,
-               (unsigned)g_meta[i].fade_value, (unsigned)g_meta[i].sens_value,
-               is_presence ? "true" : "false");
+               (unsigned)g_meta[i].keep_time_sec, (unsigned)g_meta[i].sensitivity,
+               is_pir ? "true" : "false");
         }
         unlock_config();
     }

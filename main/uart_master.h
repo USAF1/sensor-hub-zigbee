@@ -103,8 +103,6 @@ void uart_master_send_pairing_complete(int new_sensors, int total_sensors);
 void uart_master_send_hub_aggregate(const char *state);
 void uart_master_send_sensor_presence(const char *sensor_name,
                                       const char *model, bool presence);
-void uart_master_send_environment(const char *sensor_name,
-                                  float temp_c, float humidity_pct);
 void uart_master_send_door(const char *sensor_name, bool is_open);
 void uart_master_notify_door_state(int sensor_idx, const char *sensor_name,
                                    bool is_open);
