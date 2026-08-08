@@ -1,14 +1,19 @@
 /*
  * main.h — Sensor Hub Zigbee Coordinator
- * Innovatsii EMS — Pico 1  |  Firmware 0.2.5
+ * Innovatsii EMS — Pico 1  |  Firmware 0.3.0
  *
  * Hub is a pure data reporter:
- *   - Identifies sensors (ZG-204ZV, ZG-205Z/A, ZG-102Z/ZA)
+ *   - Identifies sensors (ZG-204ZL PIR, ZG-102Z/ZA door)
  *   - Presence via Tuya EF00 DP 1; door via IAS Zone; battery via PowerConfig
- *   - Writes fading_time (DP 102) and motion sensitivity (DP 2) to mmWave
+ *   - Writes keep_time (DP 10) and sensitivity (DP 9) to ZG-204ZL PIR
  *   - hub_aggregate = OR of online presence sensors (no door logic)
  *   - Persists sensors + network; instant rejoin on reboot
  *   - Never calculates unit occupancy (Master does that)
+ *
+ * PROTOCOL NOTE: The 'environment' message and temp/hum fields have been
+ * removed. Neither the ZG-204ZL PIR nor the ZG-102Z door sensors report
+ * temperature or humidity. The Master must be updated to remove handling
+ * of the 'environment' message type.
  */
 
 #ifndef MAIN_H
@@ -26,7 +31,7 @@
 // FIRMWARE VERSION
 // ============================================================================
 
-#define FIRMWARE_VERSION    "0.2.5"
+#define FIRMWARE_VERSION    "0.3.0"
 #define FIRMWARE_COMPONENT  "sensor_hub"
 
 // ============================================================================
@@ -47,9 +52,11 @@
 #define REJOIN_RETRY_DELAY_MS 10000
 #define REJOIN_POLL_GAP_MS    500
 
-/* Presence sensor config defaults (written via Tuya EF00 at join) */
-#define PRESENCE_FADING_TIME_DEFAULT_SEC 30
-#define PRESENCE_SENSITIVITY_DEFAULT     9
+/* ZG-204ZL PIR sensor config defaults (written via Tuya EF00 at join).
+ * keep_time_sec must be one of {10, 30, 60, 120} — mapped to DP10 enum 0..3.
+ * sensitivity is 0=low / 1=medium / 2=high (DP9 enum). */
+#define PIR_KEEP_TIME_DEFAULT_SEC  30
+#define PIR_SENSITIVITY_DEFAULT    1
 
 /* Model ID read timeout — ZG-102Z (sleepy) never responds → infer door type */
 #define MODEL_ID_TIMEOUT_MS  5000
@@ -75,11 +82,11 @@ typedef enum {
 } hub_aggregate_t;
 
 typedef enum {
-    SENSOR_UNKNOWN   = 0,
-    SENSOR_ZG_204ZV  = 1,
-    SENSOR_ZG_205Z_A = 2,
-    SENSOR_ZG_102Z   = 3,
-    SENSOR_ZG_102ZA  = 4,
+    SENSOR_UNKNOWN  = 0,
+    SENSOR_ZG_204ZL = 1,  /* HOBEIAN PIR "Luminance motion sensor" — Tuya EF00 */
+    /* 2 = reserved (was ZG-205Z/A mmWave, removed) */
+    SENSOR_ZG_102Z  = 3,  /* Tuya door/window sensor               — IAS Zone  */
+    SENSOR_ZG_102ZA = 4,  /* Tuya door/window sensor (A variant)   — IAS Zone  */
 } sensor_type_t;
 
 typedef enum {
@@ -108,8 +115,6 @@ typedef struct {
     bool     contact_open;
     bool     tamper;
     bool     battery_low;
-    int16_t  temperature_cdeg;
-    uint16_t humidity_cpct;
     uint8_t  battery_pct;
     time_t   last_seen;
     time_t   last_change;
@@ -149,7 +154,7 @@ typedef struct {
     uint8_t           ep_active;
 
     bool              reporting_configured;
-    bool              fade_sent;
+    bool              config_sent;        /* initial keep_time/sensitivity sent */
 
     uint32_t          model_id_req_ms;
     bool              model_id_pending;
@@ -158,8 +163,11 @@ typedef struct {
     uint8_t           miss_count;
     uint8_t           rejoin_count;
 
-    uint16_t          fade_value;   /* current fading_time (s)  — pushed at join */
-    uint8_t           sens_value;   /* current sensitivity 0-19 — pushed at join */
+    /* ZG-204ZL PIR config — reported back from device via DP9/DP10.
+     * keep_time_sec: one of 10/30/60/120 (seconds).
+     * sensitivity:   0=low, 1=medium, 2=high. */
+    uint16_t          keep_time_sec;
+    uint8_t           sensitivity;
 
     bool              enroll_sent;
 } sensor_runtime_meta_t;
@@ -189,8 +197,8 @@ const char   *friendly_name_from_type(sensor_type_t t);
 const char   *hub_aggregate_str(hub_aggregate_t a);
 const char   *role_str(sensor_role_t r);
 
-/* Push fading_time / motion sensitivity to a presence sensor.
- * Pass -1 for a field to leave it unchanged. Implemented in main.c. */
-void          hub_set_sensor_config(int idx, int fading_sec, int sensitivity);
+/* Push keep_time / sensitivity config to a PIR presence sensor.
+ * Pass -1 for a field to leave it unchanged. Implemented in tuya_ef00.c. */
+void          hub_set_sensor_config(int idx, int keep_time_sec, int sensitivity);
 
 #endif /* MAIN_H */
